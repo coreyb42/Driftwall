@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution
+*.whl
+*.tar.gz
+
+# Database
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Config (contains personal paths)
+# ~/.config/driftwall/config.toml is intentionally not tracked
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary scripts
+cleanup_*.py

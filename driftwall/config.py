@@ -1,0 +1,143 @@
+"""Configuration loading and dataclasses for Driftwall."""
+
+from __future__ import annotations
+
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib  # type: ignore[no-redef]
+
+DEFAULT_CONFIG_PATH = Path.home() / ".config" / "driftwall" / "config.toml"
+DEFAULT_PROMPT_PATH = Path(__file__).parent.parent / "photo_class_prompt.txt"
+
+
+@dataclass
+class OllamaConfig:
+    model: str = "qwen3-vl:30b"
+    timeout: int = 120
+    concurrency: int = 1
+    host: str = "http://localhost:11434"
+    max_image_pixels: int = 1344  # longest edge before sending to model; 0 = no resize
+
+
+@dataclass
+class RotationConfig:
+    interval_minutes: int = 30
+    avoid_repeat_window: int = 50
+
+
+@dataclass
+class FilterConfig:
+    exclude_genre: list[str] = field(default_factory=list)
+    exclude_faces: bool = False
+    min_megapixels: float = 0.0
+    require_setting: list[str] = field(default_factory=list)
+    require_orientation: list[str] = field(default_factory=list)
+
+
+@dataclass
+class TimeOfDayMapping:
+    hours: list[int]  # list of hours (0-23) this applies to
+    values: list[str]  # time_of_day values to prefer
+
+
+@dataclass
+class TriggerConfig:
+    enabled: bool = True
+    time_of_day_map: list[TimeOfDayMapping] = field(default_factory=list)
+    season_map: dict[str, list[str]] = field(default_factory=dict)  # month_range -> seasons
+
+
+@dataclass
+class Config:
+    image_dir: Path = field(default_factory=lambda: Path.home() / "Pictures")
+    db_path: Path | None = None  # defaults to image_dir/driftwall.db
+    prompt_path: Path = field(default_factory=lambda: DEFAULT_PROMPT_PATH)
+    ollama: OllamaConfig = field(default_factory=OllamaConfig)
+    rotation: RotationConfig = field(default_factory=RotationConfig)
+    filters: FilterConfig = field(default_factory=FilterConfig)
+    triggers: TriggerConfig = field(default_factory=TriggerConfig)
+
+    @property
+    def resolved_db_path(self) -> Path:
+        if self.db_path is not None:
+            return self.db_path
+        # Default to local storage — SQLite file locking doesn't work on
+        # network/FUSE filesystems (Samba, NFS, etc.).
+        return Path.home() / ".local" / "share" / "driftwall" / "driftwall.db"
+
+
+def _parse_time_of_day_map(raw: list[dict[str, Any]]) -> list[TimeOfDayMapping]:
+    result = []
+    for entry in raw:
+        hours = entry.get("hours", [])
+        values = entry.get("values", [])
+        if isinstance(values, str):
+            values = [values]
+        result.append(TimeOfDayMapping(hours=hours, values=values))
+    return result
+
+
+def load_config(path: Path | None = None) -> Config:
+    """Load config from TOML file, merging with defaults."""
+    config_path = path or DEFAULT_CONFIG_PATH
+
+    raw: dict[str, Any] = {}
+    if config_path.exists():
+        with open(config_path, "rb") as f:
+            raw = tomllib.load(f)
+
+    image_dir = Path(raw.get("image_dir", str(Path.home() / "Pictures")))
+    db_path_raw = raw.get("db_path")
+    db_path = Path(db_path_raw) if db_path_raw else None
+    prompt_path = Path(raw.get("prompt_path", str(DEFAULT_PROMPT_PATH)))
+
+    ollama_raw = raw.get("ollama", {})
+    ollama = OllamaConfig(
+        model=ollama_raw.get("model", "qwen3-vl:30b"),
+        timeout=ollama_raw.get("timeout", 120),
+        concurrency=ollama_raw.get("concurrency", 1),
+        host=ollama_raw.get("host", "http://localhost:11434"),
+        max_image_pixels=ollama_raw.get("max_image_pixels", 1344),
+    )
+
+    rotation_raw = raw.get("rotation", {})
+    rotation = RotationConfig(
+        interval_minutes=rotation_raw.get("interval_minutes", 30),
+        avoid_repeat_window=rotation_raw.get("avoid_repeat_window", 50),
+    )
+
+    filters_raw = raw.get("filters", {})
+    filters = FilterConfig(
+        exclude_genre=filters_raw.get("exclude_genre", []),
+        exclude_faces=filters_raw.get("exclude_faces", False),
+        min_megapixels=float(filters_raw.get("min_megapixels", 0.0)),
+        require_setting=filters_raw.get("require_setting", []),
+        require_orientation=filters_raw.get("require_orientation", []),
+    )
+
+    triggers_raw = raw.get("triggers", {})
+    tod_map_raw = triggers_raw.get("time_of_day_map", [])
+    triggers = TriggerConfig(
+        enabled=triggers_raw.get("enabled", True),
+        time_of_day_map=_parse_time_of_day_map(tod_map_raw),
+        season_map=triggers_raw.get("season_map", {}),
+    )
+
+    return Config(
+        image_dir=image_dir,
+        db_path=db_path,
+        prompt_path=prompt_path,
+        ollama=ollama,
+        rotation=rotation,
+        filters=filters,
+        triggers=triggers,
+    )
