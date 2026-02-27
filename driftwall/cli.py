@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .config import load_config
 from .db import get_stats, init_db
+from .overlay import apply_overlay, generate_overlay_text
 from .scanner import scan_directory
 from .selector import select_image
 from .triggers import FilterCriteria, get_active_triggers, merge_criteria
@@ -94,8 +95,35 @@ def cmd_rotate(args: argparse.Namespace) -> int:
         print(f"Image file missing: {path}", file=sys.stderr)
         return 1
 
+    # Optional text overlay
+    wallpaper_path = path
+    use_overlay = config.overlay.enabled and not getattr(args, "no_overlay", False)
+    if use_overlay:
+        description = image.one_paragraph or image.one_sentence
+        if description:
+            overlay_model = config.overlay.model or config.ollama.model
+            logging.info("Generating overlay text via %s…", overlay_model)
+            text = generate_overlay_text(
+                description=description,
+                prompt=config.overlay.prompt,
+                model=overlay_model,
+                host=config.ollama.host,
+                timeout=config.ollama.timeout,
+                num_predict=config.ollama.num_predict,
+            )
+            if text:
+                cache_path = Path.home() / ".cache" / "driftwall" / "overlay.jpg"
+                wallpaper_path = apply_overlay(
+                    image_path=path,
+                    text=text,
+                    quadrant=config.overlay.quadrant,
+                    font_path=config.overlay.font_path,
+                    output_path=cache_path,
+                )
+                logging.info("Overlay applied: %s", text.replace("\n", " / "))
+
     try:
-        set_wallpaper(path)
+        set_wallpaper(wallpaper_path)
         print(f"Wallpaper set: {path.name}")
         if args.verbose:
             print(f"  genre={image.genre} time_of_day={image.time_of_day} season={image.season}")
@@ -114,6 +142,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     rotate_args = argparse.Namespace(
         config=args.config,
         no_triggers=False,
+        no_overlay=False,
         genre=None,
         mood=None,
         orientation=None,
@@ -170,6 +199,7 @@ def cmd_config(args: argparse.Namespace) -> int:
     print(f"  timeout:     {config.ollama.timeout}s")
     print(f"  concurrency: {config.ollama.concurrency}")
     print(f"  host:        {config.ollama.host}")
+    print(f"  num_predict: {config.ollama.num_predict}")
     print()
     print("[rotation]")
     print(f"  interval:    {config.rotation.interval_minutes}min")
@@ -184,6 +214,13 @@ def cmd_config(args: argparse.Namespace) -> int:
     print()
     print("[triggers]")
     print(f"  enabled:     {config.triggers.enabled}")
+    print()
+    print("[overlay]")
+    print(f"  enabled:     {config.overlay.enabled}")
+    print(f"  prompt:      {config.overlay.prompt}")
+    print(f"  model:       {config.overlay.model or '(same as ollama.model)'}")
+    print(f"  quadrant:    {config.overlay.quadrant}")
+    print(f"  font_path:   {config.overlay.font_path or '(auto)'}")
 
     return 0
 
@@ -212,6 +249,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_rotate.add_argument("--mood", nargs="+", metavar="MOOD", help="Prefer specific mood(s)")
     p_rotate.add_argument("--orientation", nargs="+", metavar="ORI", help="Require orientation(s)")
     p_rotate.add_argument("--no-triggers", action="store_true", help="Disable automatic triggers")
+    p_rotate.add_argument("--no-overlay", action="store_true", help="Skip text overlay even if enabled in config")
 
     # daemon
     p_daemon = sub.add_parser("daemon", help="Rotate wallpaper on a timer")

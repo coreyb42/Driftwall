@@ -41,5 +41,8 @@ Thumbs.db
 # Logs
 *.log
 
+# LLM failure captures
+driftwall/llm_failures/
+
 # Temporary scripts
 cleanup_*.py

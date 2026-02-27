@@ -19,6 +19,12 @@ class ClassificationError(Exception):
     pass
 
 
+class ClassificationParseError(ClassificationError):
+    def __init__(self, message: str, raw_text: str) -> None:
+        super().__init__(message)
+        self.raw_text = raw_text
+
+
 def hash_file(path: Path) -> str:
     """Compute SHA-256 hex digest of a file."""
     h = hashlib.sha256()
@@ -33,7 +39,7 @@ def load_prompt(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _prepare_image(path: Path, max_pixels: int) -> bytes:
+def prepare_image(path: Path, max_pixels: int) -> bytes:
     """
     Load an image, downscale so the longest edge <= max_pixels, return JPEG bytes.
     The original file is never modified.
@@ -69,7 +75,12 @@ def _prepare_image(path: Path, max_pixels: int) -> bytes:
         return buf.getvalue()
 
 
-def classify_image(path: Path, prompt: str, ollama_config: OllamaConfig) -> dict[str, Any]:
+def classify_image(
+    path: Path,
+    prompt: str,
+    ollama_config: OllamaConfig,
+    image_bytes: bytes | None = None,
+) -> dict[str, Any]:
     """
     Send the image to Ollama and return the parsed JSON classification.
     Raises ClassificationError on any failure.
@@ -80,7 +91,8 @@ def classify_image(path: Path, prompt: str, ollama_config: OllamaConfig) -> dict
         raise ClassificationError("ollama package not installed") from e
 
     client = ollama.Client(host=ollama_config.host)
-    image_bytes = _prepare_image(path, ollama_config.max_image_pixels)
+    if image_bytes is None:
+        image_bytes = prepare_image(path, ollama_config.max_image_pixels)
 
     try:
         response = client.chat(
@@ -93,7 +105,7 @@ def classify_image(path: Path, prompt: str, ollama_config: OllamaConfig) -> dict
                 }
             ],
             think=True,
-            options={"num_predict": 2048},
+            options={"num_predict": ollama_config.num_predict},
         )
     except Exception as e:
         raise ClassificationError(f"Ollama request failed for {path}: {e}") from e
@@ -117,7 +129,12 @@ def classify_image(path: Path, prompt: str, ollama_config: OllamaConfig) -> dict
     if not content.strip():
         raise ClassificationError(f"Empty response from model for {path.name}.")
 
-    return extract_json_from_response(content, path.name)
+    try:
+        return extract_json_from_response(content, path.name)
+    except ClassificationError as e:
+        if content.strip():
+            raise ClassificationParseError(str(e), raw_text=content) from e
+        raise
 
 
 def extract_json_from_response(text: str, label: str = "") -> dict[str, Any]:

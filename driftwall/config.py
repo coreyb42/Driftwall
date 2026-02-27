@@ -26,6 +26,7 @@ class OllamaConfig:
     concurrency: int = 1
     host: str = "http://localhost:11434"
     max_image_pixels: int = 1344  # longest edge before sending to model; 0 = no resize
+    num_predict: int = 48000  # max tokens to predict (Ollama num_predict)
 
 
 @dataclass
@@ -57,6 +58,15 @@ class TriggerConfig:
 
 
 @dataclass
+class OverlayConfig:
+    enabled: bool = False
+    prompt: str = "a haiku"
+    model: str = "lfm2.5-thinking"
+    font_path: str = ""  # empty = auto-detect
+    quadrant: str = "bottom-right"  # top-left, top-right, bottom-left, bottom-right
+
+
+@dataclass
 class Config:
     image_dir: Path = field(default_factory=lambda: Path.home() / "Pictures")
     db_path: Path | None = None  # defaults to image_dir/driftwall.db
@@ -65,6 +75,7 @@ class Config:
     rotation: RotationConfig = field(default_factory=RotationConfig)
     filters: FilterConfig = field(default_factory=FilterConfig)
     triggers: TriggerConfig = field(default_factory=TriggerConfig)
+    overlay: OverlayConfig = field(default_factory=OverlayConfig)
 
     @property
     def resolved_db_path(self) -> Path:
@@ -107,6 +118,7 @@ def load_config(path: Path | None = None) -> Config:
         concurrency=ollama_raw.get("concurrency", 1),
         host=ollama_raw.get("host", "http://localhost:11434"),
         max_image_pixels=ollama_raw.get("max_image_pixels", 1344),
+        num_predict=ollama_raw.get("num_predict", 48000),
     )
 
     rotation_raw = raw.get("rotation", {})
@@ -132,6 +144,15 @@ def load_config(path: Path | None = None) -> Config:
         season_map=triggers_raw.get("season_map", {}),
     )
 
+    overlay_raw = raw.get("overlay", {})
+    overlay = OverlayConfig(
+        enabled=overlay_raw.get("enabled", False),
+        prompt=overlay_raw.get("prompt", "a haiku"),
+        model=overlay_raw.get("model", "lfm2.5-thinking"),
+        font_path=overlay_raw.get("font_path", ""),
+        quadrant=overlay_raw.get("quadrant", "bottom-right"),
+    )
+
     return Config(
         image_dir=image_dir,
         db_path=db_path,
@@ -140,4 +161,5 @@ def load_config(path: Path | None = None) -> Config:
         rotation=rotation,
         filters=filters,
         triggers=triggers,
+        overlay=overlay,
     )
