@@ -23,6 +23,18 @@ _FONT_CANDIDATES = [
 ]
 
 
+_WRAPPER_LINE_RE = re.compile(
+    r"^(?:"
+    r"here(?:'s| is)?\b|"
+    r"sure\b|certainly\b|of course\b|"
+    r"note\b[:\-]?|explanation\b[:\-]?|"
+    r"output\b[:\-]?|response\b[:\-]?|text\b[:\-]?|"
+    r"haiku\b[:\-]?|poem\b[:\-]?|caption\b[:\-]?"
+    r")",
+    flags=re.IGNORECASE,
+)
+
+
 def _resolve_font(font_path: str) -> str | None:
     """Return the first usable font path, or None to fall back to Pillow default."""
     if font_path and Path(font_path).exists():
@@ -31,6 +43,38 @@ def _resolve_font(font_path: str) -> str | None:
         if Path(candidate).exists():
             return candidate
     return None
+
+
+def _sanitize_overlay_text(text: str) -> str:
+    """Remove common model wrappers and keep only renderable overlay text."""
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    # Prefer fenced block content when present.
+    fence_blocks = re.findall(r"```(?:\w+)?\s*([\s\S]*?)\s*```", cleaned, flags=re.MULTILINE)
+    if fence_blocks:
+        cleaned = fence_blocks[0].strip()
+
+    # Remove residual fence markers and markdown emphasis markers.
+    cleaned = cleaned.replace("```", "").strip()
+    cleaned = re.sub(r"^[*_`]+|[*_`]+$", "", cleaned).strip()
+
+    # Unwrap a single surrounding quote pair.
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'"}:
+        cleaned = cleaned[1:-1].strip()
+
+    lines = [line.strip() for line in cleaned.split("\n")]
+
+    # Trim wrapper/preamble lines at edges only.
+    while lines and (not lines[0] or _WRAPPER_LINE_RE.match(lines[0])):
+        lines.pop(0)
+    while lines and (not lines[-1] or _WRAPPER_LINE_RE.match(lines[-1])):
+        lines.pop()
+
+    # Remove simple "Label: value" on first line.
+    if lines and re.match(r"^[A-Za-z ]{2,20}:\s+", lines[0]):
+        lines[0] = re.sub(r"^[A-Za-z ]{2,20}:\s+", "", lines[0]).strip()
+
+    return "\n".join(line for line in lines if line).strip()
 
 
 def generate_overlay_text(
@@ -57,8 +101,8 @@ def generate_overlay_text(
 
     full_prompt = (
         f"Based on this image description, write {prompt}. "
-        "Output only the text itself — no preamble, no title, no explanation, "
-        "and no punctuation beyond what naturally belongs in the text.\n\n"
+        "Output only the text itself. Do not include markdown, quotes, labels, "
+        "headers, notes, explanations, or any prefix/suffix text.\n\n"
         f"Image description: {description}"
     )
 
@@ -80,7 +124,9 @@ def generate_overlay_text(
     # Also handle unclosed <think> tags in case of truncation.
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
-    text = text.strip()
+    text = _sanitize_overlay_text(text)
+    if text != raw_text.strip():
+        logger.debug("Overlay response sanitized. raw_len=%d clean_len=%d", len(raw_text), len(text))
     if not text:
         raw_preview = raw_text[:240].replace("\n", "\\n")
         logger.warning(
@@ -132,18 +178,9 @@ def apply_overlay(
     else:
         font = ImageFont.load_default(size=font_size)
 
-    # ── quadrant box ─────────────────────────────────────────────────────────
+    # ── wrap target width ────────────────────────────────────────────────────
     pad = int(min(w, h) * 0.045)
-    hw, hh = w // 2, h // 2
-    boxes = {
-        "top-left":     (pad,      pad,      hw - pad, hh - pad),
-        "top-right":    (hw + pad, pad,      w  - pad, hh - pad),
-        "bottom-left":  (pad,      hh + pad, hw - pad, h  - pad),
-        "bottom-right": (hw + pad, hh + pad, w  - pad, h  - pad),
-    }
-    x0, y0, x1, y1 = boxes.get(quadrant, boxes["bottom-right"])
-    box_w = x1 - x0
-    box_h = y1 - y0
+    max_text_w = max(220, int(w * 0.42))
 
     # ── word-wrap ─────────────────────────────────────────────────────────────
     # Estimate character width from the font; getlength is more accurate than bbox.
@@ -151,7 +188,7 @@ def apply_overlay(
         char_w = font.getlength("m")
     except AttributeError:
         char_w = font_size * 0.55
-    chars_per_line = max(8, int(box_w / char_w))
+    chars_per_line = max(8, int(max_text_w / char_w))
 
     lines: list[str] = []
     for para in text.split("\n"):
@@ -161,8 +198,36 @@ def apply_overlay(
     line_h = int(font_size * 1.45)
     total_text_h = len(lines) * line_h
 
-    # Vertically centre the block in the quadrant.
-    text_y = y0 + max(0, (box_h - total_text_h) // 2)
+    # Measure block width so the scrim hugs text instead of spanning the quadrant.
+    line_widths: list[float] = []
+    for line in lines:
+        if not line:
+            line_widths.append(char_w * 2)
+            continue
+        try:
+            line_widths.append(font.getlength(line))
+        except AttributeError:
+            line_widths.append(len(line) * char_w)
+    text_block_w = int(max(line_widths)) if line_widths else int(char_w * 2)
+    text_block_h = total_text_h
+
+    # Place block near selected corner.
+    corner_margin = pad
+    if quadrant == "top-left":
+        text_x = corner_margin
+        text_y = corner_margin
+    elif quadrant == "top-right":
+        text_x = w - corner_margin - text_block_w
+        text_y = corner_margin
+    elif quadrant == "bottom-left":
+        text_x = corner_margin
+        text_y = h - corner_margin - text_block_h
+    else:  # bottom-right (default)
+        text_x = w - corner_margin - text_block_w
+        text_y = h - corner_margin - text_block_h
+
+    text_x = max(corner_margin, text_x)
+    text_y = max(corner_margin, text_y)
 
     # ── compositing ──────────────────────────────────────────────────────────
     # Re-open to avoid mutating the cached object inside the context manager.
@@ -177,10 +242,16 @@ def apply_overlay(
         # Semi-transparent dark scrim behind the text block for readability.
         bg_pad = int(font_size * 0.5)
         scrim_box = (
-            x0 - bg_pad,
+            text_x - bg_pad,
             text_y - bg_pad,
-            x1,
-            text_y + total_text_h + bg_pad,
+            text_x + text_block_w + bg_pad,
+            text_y + text_block_h + bg_pad,
+        )
+        scrim_box = (
+            max(0, scrim_box[0]),
+            max(0, scrim_box[1]),
+            min(w, scrim_box[2]),
+            min(h, scrim_box[3]),
         )
         scrim = Image.new("RGBA", orig.size, (0, 0, 0, 0))
         ImageDraw.Draw(scrim).rounded_rectangle(scrim_box, radius=font_size // 3, fill=(0, 0, 0, 130))
@@ -188,10 +259,11 @@ def apply_overlay(
 
         draw = ImageDraw.Draw(result)
         shadow_off = max(2, font_size // 14)
+        draw_y = text_y
         for line in lines:
-            draw.text((x0 + shadow_off, text_y + shadow_off), line, font=font, fill=(0, 0, 0))
-            draw.text((x0, text_y), line, font=font, fill=(255, 255, 255))
-            text_y += line_h
+            draw.text((text_x + shadow_off, draw_y + shadow_off), line, font=font, fill=(0, 0, 0))
+            draw.text((text_x, draw_y), line, font=font, fill=(255, 255, 255))
+            draw_y += line_h
 
         result.save(output_path, format="JPEG", quality=95)
 
