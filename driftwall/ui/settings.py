@@ -33,6 +33,75 @@ def _row(label_text: str, widget: Gtk.Widget) -> Gtk.Box:
     return box
 
 
+class _DirListWidget(Gtk.Box):
+    """A vertical list of directory paths with Add / Remove controls."""
+
+    def __init__(self, paths: list[str]) -> None:
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self._rows: list[tuple[Gtk.Entry, Gtk.Button]] = []
+
+        self._list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.pack_start(self._list_box, True, True, 0)
+
+        add_btn = Gtk.Button(label="+ Add folder…")
+        add_btn.connect("clicked", self._on_add)
+        self.pack_start(add_btn, False, False, 0)
+
+        for p in paths:
+            self._add_row(p)
+
+    def _add_row(self, path: str = "") -> None:
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        entry = Gtk.Entry()
+        entry.set_text(path)
+        entry.set_hexpand(True)
+
+        pick_btn = Gtk.Button(label="…")
+        pick_btn.connect("clicked", self._on_pick, entry)
+
+        rm_btn = Gtk.Button(label="✕")
+        rm_btn.connect("clicked", self._on_remove, row)
+
+        row.pack_start(entry, True, True, 0)
+        row.pack_start(pick_btn, False, False, 0)
+        row.pack_start(rm_btn, False, False, 0)
+        self._list_box.pack_start(row, False, False, 0)
+        self._rows.append((entry, rm_btn))
+        row.show_all()
+
+    def _on_add(self, _btn: Gtk.Button) -> None:
+        self._add_row("")
+
+    def _on_pick(self, _btn: Gtk.Button, entry: Gtk.Entry) -> None:
+        dialog = Gtk.FileChooserDialog(
+            title="Select image directory",
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_OPEN, Gtk.ResponseType.OK,
+        )
+        current = entry.get_text().strip()
+        if current:
+            dialog.set_filename(current)
+        if dialog.run() == Gtk.ResponseType.OK:
+            entry.set_text(dialog.get_filename() or "")
+        dialog.destroy()
+
+    def _on_remove(self, _btn: Gtk.Button, row: Gtk.Box) -> None:
+        self._list_box.remove(row)
+        self._rows = [(e, b) for e, b in self._rows if b.get_parent() is not None]
+
+    def get_paths(self) -> list[str]:
+        paths = []
+        for child in self._list_box.get_children():
+            entry = child.get_children()[0]
+            val = entry.get_text().strip()
+            if val:
+                paths.append(val)
+        return paths
+
+
 def _spin(
     value: float,
     lo: float,
@@ -104,13 +173,15 @@ class SettingsDialog(Gtk.Dialog):
 
         from driftwall.config import DEFAULT_PROMPT_PATH
 
-        self._image_dir_btn = Gtk.FileChooserButton(
-            title="Select image directory",
-            action=Gtk.FileChooserAction.SELECT_FOLDER,
-        )
-        img_dir = raw.get("image_dir", str(Path.home() / "Pictures"))
-        self._image_dir_btn.set_filename(img_dir)
-        box.pack_start(_row("Image directory", self._image_dir_btn), False, False, 0)
+        # Resolve initial dirs: prefer image_dirs list, fall back to image_dir string.
+        if "image_dirs" in raw:
+            initial_dirs = [str(d) for d in raw["image_dirs"]]
+        elif "image_dir" in raw:
+            initial_dirs = [raw["image_dir"]]
+        else:
+            initial_dirs = [str(Path.home() / "Pictures")]
+        self._image_dirs_widget = _DirListWidget(initial_dirs)
+        box.pack_start(_row("Image directories", self._image_dirs_widget), False, False, 0)
 
         self._db_path_entry = Gtk.Entry()
         self._db_path_entry.set_placeholder_text(
@@ -207,9 +278,26 @@ class SettingsDialog(Gtk.Dialog):
         switch_box.pack_start(self._overlay_enabled, False, False, 0)
         box.pack_start(switch_box, False, False, 0)
 
-        self._overlay_prompt = Gtk.Entry()
-        self._overlay_prompt.set_text(ov.get("prompt", "a haiku"))
-        box.pack_start(_row("Prompt", self._overlay_prompt), False, False, 0)
+        # Prompts — one per line in a small text view.
+        prompt_raw = ov.get("prompt", ["a haiku"])
+        if isinstance(prompt_raw, list):
+            prompt_text = "\n".join(prompt_raw)
+        else:
+            prompt_text = str(prompt_raw)
+        self._overlay_prompts_buf = Gtk.TextBuffer()
+        self._overlay_prompts_buf.set_text(prompt_text)
+        prompt_view = Gtk.TextView(buffer=self._overlay_prompts_buf)
+        prompt_view.set_wrap_mode(Gtk.WrapMode.WORD)
+        prompt_scroll = Gtk.ScrolledWindow()
+        prompt_scroll.set_min_content_height(72)
+        prompt_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        prompt_scroll.add(prompt_view)
+        prompt_hint = Gtk.Label(xalign=0.0)
+        prompt_hint.set_markup("<small>One prompt per line — a random one is picked each rotation</small>")
+        prompt_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        prompt_col.pack_start(prompt_scroll, True, True, 0)
+        prompt_col.pack_start(prompt_hint, False, False, 0)
+        box.pack_start(_row("Prompts", prompt_col), False, False, 0)
 
         self._overlay_model = Gtk.Entry()
         self._overlay_model.set_text(ov.get("model", ""))
@@ -217,13 +305,23 @@ class SettingsDialog(Gtk.Dialog):
         box.pack_start(_row("Model", self._overlay_model), False, False, 0)
 
         _quadrants = ["top-left", "top-right", "bottom-left", "bottom-right"]
-        self._overlay_quadrant = Gtk.ComboBoxText()
+        quadrant_raw = ov.get("quadrant", ["bottom-right"])
+        active_quadrants: set[str] = set(
+            quadrant_raw if isinstance(quadrant_raw, list) else [quadrant_raw]
+        )
+        quad_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._quadrant_checks: dict[str, Gtk.CheckButton] = {}
         for q in _quadrants:
-            self._overlay_quadrant.append_text(q)
-        quadrant = ov.get("quadrant", "bottom-right")
-        idx = _quadrants.index(quadrant) if quadrant in _quadrants else 3
-        self._overlay_quadrant.set_active(idx)
-        box.pack_start(_row("Quadrant", self._overlay_quadrant), False, False, 0)
+            cb = Gtk.CheckButton(label=q)
+            cb.set_active(q in active_quadrants)
+            quad_box.pack_start(cb, False, False, 0)
+            self._quadrant_checks[q] = cb
+        quad_hint = Gtk.Label(xalign=0.0)
+        quad_hint.set_markup("<small>Checked positions are picked randomly each rotation</small>")
+        quad_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        quad_col.pack_start(quad_box, False, False, 0)
+        quad_col.pack_start(quad_hint, False, False, 0)
+        box.pack_start(_row("Quadrant", quad_col), False, False, 0)
 
         self._overlay_font_file = Gtk.FileChooserButton(
             title="Select specific font file",
@@ -264,9 +362,10 @@ class SettingsDialog(Gtk.Dialog):
         data: dict[str, Any] = dict(self._raw)
 
         # General
-        img_dir = self._image_dir_btn.get_filename() or ""
-        if img_dir:
-            data["image_dir"] = img_dir
+        dirs = self._image_dirs_widget.get_paths()
+        if dirs:
+            data["image_dirs"] = dirs
+            data.pop("image_dir", None)  # remove legacy key
         db_path_text = self._db_path_entry.get_text().strip()
         if db_path_text:
             data["db_path"] = db_path_text
@@ -312,15 +411,23 @@ class SettingsDialog(Gtk.Dialog):
         }
 
         # Overlay
-        _quadrants = ["top-left", "top-right", "bottom-left", "bottom-right"]
-        qi = self._overlay_quadrant.get_active()
-        quadrant = _quadrants[qi] if 0 <= qi < len(_quadrants) else "bottom-right"
+        start, end = self._overlay_prompts_buf.get_bounds()
+        prompts = [
+            line.strip()
+            for line in self._overlay_prompts_buf.get_text(start, end, False).splitlines()
+            if line.strip()
+        ]
+        if not prompts:
+            prompts = ["a haiku"]
+        active_quads = [q for q, cb in self._quadrant_checks.items() if cb.get_active()]
+        if not active_quads:
+            active_quads = ["bottom-right"]
         data["overlay"] = {
             **data.get("overlay", {}),
             "enabled": self._overlay_enabled.get_active(),
-            "prompt": self._overlay_prompt.get_text().strip(),
+            "prompt": prompts,
             "model": self._overlay_model.get_text().strip(),
-            "quadrant": quadrant,
+            "quadrant": active_quads,
             "font_file": self._overlay_font_file.get_filename() or "",
             "font_dir": self._overlay_font_dir.get_filename() or "",
         }

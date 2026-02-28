@@ -60,17 +60,17 @@ class TriggerConfig:
 @dataclass
 class OverlayConfig:
     enabled: bool = False
-    prompt: str = "a haiku"
+    prompts: list[str] = field(default_factory=lambda: ["a haiku"])
     model: str = "lfm2.5-thinking"
     font_file: str = ""   # path to a specific font file; empty = auto-detect from system candidates
     font_dir: str = ""    # directory to scan recursively for .ttf fonts; LLM picks one
-    quadrant: str = "bottom-right"  # top-left, top-right, bottom-left, bottom-right
+    quadrants: list[str] = field(default_factory=lambda: ["bottom-right"])  # top-left, top-right, bottom-left, bottom-right
 
 
 @dataclass
 class Config:
-    image_dir: Path = field(default_factory=lambda: Path.home() / "Pictures")
-    db_path: Path | None = None  # defaults to image_dir/driftwall.db
+    image_dirs: list[Path] = field(default_factory=lambda: [Path.home() / "Pictures"])
+    db_path: Path | None = None
     prompt_path: Path = field(default_factory=lambda: DEFAULT_PROMPT_PATH)
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
     rotation: RotationConfig = field(default_factory=RotationConfig)
@@ -82,7 +82,7 @@ class Config:
     def resolved_db_path(self) -> Path:
         if self.db_path is not None:
             return self.db_path
-        # Default to local storage — SQLite file locking doesn't work on
+        # Central location — SQLite file locking doesn't work on
         # network/FUSE filesystems (Samba, NFS, etc.).
         return Path.home() / ".local" / "share" / "driftwall" / "driftwall.db"
 
@@ -107,7 +107,13 @@ def load_config(path: Path | None = None) -> Config:
         with open(config_path, "rb") as f:
             raw = tomllib.load(f)
 
-    image_dir = Path(raw.get("image_dir", str(Path.home() / "Pictures")))
+    # Accept image_dirs (list) or legacy image_dir (single path).
+    if "image_dirs" in raw:
+        image_dirs = [Path(d) for d in raw["image_dirs"]]
+    elif "image_dir" in raw:
+        image_dirs = [Path(raw["image_dir"])]
+    else:
+        image_dirs = [Path.home() / "Pictures"]
     db_path_raw = raw.get("db_path")
     db_path = Path(db_path_raw) if db_path_raw else None
     prompt_path = Path(raw.get("prompt_path", str(DEFAULT_PROMPT_PATH)))
@@ -146,17 +152,28 @@ def load_config(path: Path | None = None) -> Config:
     )
 
     overlay_raw = raw.get("overlay", {})
+
+    def _as_list(val: Any, default: list[str]) -> list[str]:
+        if val is None:
+            return default
+        if isinstance(val, list):
+            return [str(v) for v in val if v]
+        return [str(val)] if val else default
+
+    overlay_prompts = _as_list(overlay_raw.get("prompt"), ["a haiku"])
+    overlay_quadrants = _as_list(overlay_raw.get("quadrant"), ["bottom-right"])
+
     overlay = OverlayConfig(
         enabled=overlay_raw.get("enabled", False),
-        prompt=overlay_raw.get("prompt", "a haiku"),
+        prompts=overlay_prompts,
         model=overlay_raw.get("model", "lfm2.5-thinking"),
         font_file=overlay_raw.get("font_file", ""),
         font_dir=overlay_raw.get("font_dir", ""),
-        quadrant=overlay_raw.get("quadrant", "bottom-right"),
+        quadrants=overlay_quadrants,
     )
 
     return Config(
-        image_dir=image_dir,
+        image_dirs=image_dirs,
         db_path=db_path,
         prompt_path=prompt_path,
         ollama=ollama,

@@ -30,29 +30,52 @@ def cmd_scan(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     db_path = config.resolved_db_path
 
-    print(f"Scanning: {config.image_dir}")
     if args.dry_run:
         print("(dry run — no writes)")
 
-    def progress(done: int, total: int) -> None:
-        print(f"\r  {done}/{total}", end="", flush=True)
+    total_result = None
+    for image_dir in config.image_dirs:
+        print(f"Scanning: {image_dir}")
 
-    result = scan_directory(
-        image_dir=config.image_dir,
-        db_path=db_path,
-        config=config,
-        force_reclassify=args.force,
-        dry_run=args.dry_run,
-        progress_callback=progress,
-    )
-    print()  # newline after progress
-    print(
-        f"Done in {result.duration_seconds:.1f}s — "
-        f"found={result.total_found} "
-        f"new={result.newly_classified} "
-        f"cached={result.already_classified} "
-        f"errors={result.skipped_errors}"
-    )
+        def progress(done: int, total: int) -> None:
+            print(f"\r  {done}/{total}", end="", flush=True)
+
+        result = scan_directory(
+            image_dir=image_dir,
+            db_path=db_path,
+            config=config,
+            force_reclassify=args.force,
+            dry_run=args.dry_run,
+            progress_callback=progress,
+        )
+        print()  # newline after progress
+        print(
+            f"  Done in {result.duration_seconds:.1f}s — "
+            f"found={result.total_found} "
+            f"new={result.newly_classified} "
+            f"cached={result.already_classified} "
+            f"errors={result.skipped_errors}"
+        )
+
+        if total_result is None:
+            total_result = result
+        else:
+            from .scanner import ScanResult
+            total_result = ScanResult(
+                total_found=total_result.total_found + result.total_found,
+                newly_classified=total_result.newly_classified + result.newly_classified,
+                already_classified=total_result.already_classified + result.already_classified,
+                skipped_errors=total_result.skipped_errors + result.skipped_errors,
+                duration_seconds=total_result.duration_seconds + result.duration_seconds,
+            )
+
+    if total_result and len(config.image_dirs) > 1:
+        print(
+            f"Total: found={total_result.total_found} "
+            f"new={total_result.newly_classified} "
+            f"cached={total_result.already_classified} "
+            f"errors={total_result.skipped_errors}"
+        )
     return 0
 
 
@@ -101,11 +124,14 @@ def cmd_rotate(args: argparse.Namespace) -> int:
     if use_overlay:
         description = image.one_paragraph or image.one_sentence
         if description:
+            import random as _random
+            overlay_prompt = _random.choice(config.overlay.prompts)
+            overlay_quadrant = _random.choice(config.overlay.quadrants)
             overlay_model = config.overlay.model or config.ollama.model
-            logging.info("Generating overlay text via %s…", overlay_model)
+            logging.info("Generating overlay text via %s… (prompt: %s)", overlay_model, overlay_prompt)
             text = generate_overlay_text(
                 description=description,
-                prompt=config.overlay.prompt,
+                prompt=overlay_prompt,
                 model=overlay_model,
                 host=config.ollama.host,
                 timeout=config.ollama.timeout,
@@ -128,7 +154,7 @@ def cmd_rotate(args: argparse.Namespace) -> int:
                 wallpaper_path = apply_overlay(
                     image_path=path,
                     text=text,
-                    quadrant=config.overlay.quadrant,
+                    quadrant=overlay_quadrant,
                     font_file=font_file,
                     output_path=cache_path,
                     target_aspect_ratio=get_display_aspect_ratio(),
@@ -203,7 +229,12 @@ def cmd_config(args: argparse.Namespace) -> int:
         return 0
 
     config = load_config(config_path)
-    print(f"image_dir:     {config.image_dir}")
+    if len(config.image_dirs) == 1:
+        print(f"image_dirs:    {config.image_dirs[0]}")
+    else:
+        print("image_dirs:")
+        for d in config.image_dirs:
+            print(f"  {d}")
     print(f"db_path:       {config.resolved_db_path}")
     print(f"prompt_path:   {config.prompt_path}")
     print()
@@ -230,9 +261,17 @@ def cmd_config(args: argparse.Namespace) -> int:
     print()
     print("[overlay]")
     print(f"  enabled:     {config.overlay.enabled}")
-    print(f"  prompt:      {config.overlay.prompt}")
+    prompts = config.overlay.prompts
+    if len(prompts) == 1:
+        print(f"  prompt:      {prompts[0]}")
+    else:
+        print(f"  prompts:     {prompts}")
     print(f"  model:       {config.overlay.model or '(same as ollama.model)'}")
-    print(f"  quadrant:    {config.overlay.quadrant}")
+    quadrants = config.overlay.quadrants
+    if len(quadrants) == 1:
+        print(f"  quadrant:    {quadrants[0]}")
+    else:
+        print(f"  quadrants:   {quadrants}")
     print(f"  font_file:   {config.overlay.font_file or '(auto)'}")
     print(f"  font_dir:    {config.overlay.font_dir or '(none)'}")
 
