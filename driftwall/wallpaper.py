@@ -35,3 +35,56 @@ def get_current_wallpaper() -> str | None:
     if result.returncode == 0:
         return result.stdout.strip().strip("'")
     return None
+
+
+def get_display_aspect_ratio() -> float | None:
+    """
+    Return primary display aspect ratio (width / height) from xrandr.
+    Returns None if detection fails.
+    """
+    try:
+        result = subprocess.run(
+            ["xrandr", "--query"],
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+
+    if result.returncode != 0 or not result.stdout:
+        return None
+
+    # Prefer primary monitor line: "... 2560x1440+0+0 ..."
+    for line in result.stdout.splitlines():
+        if " connected primary " in line:
+            parts = line.split()
+            for token in parts:
+                if "x" in token and "+" in token:
+                    dims = token.split("+", 1)[0]
+                    if "x" in dims:
+                        try:
+                            w_str, h_str = dims.split("x", 1)
+                            w = int(w_str)
+                            h = int(h_str)
+                            if w > 0 and h > 0:
+                                return w / h
+                        except (TypeError, ValueError):
+                            pass
+
+    # Fallback: first connected monitor line.
+    for line in result.stdout.splitlines():
+        if " connected " in line:
+            parts = line.split()
+            for token in parts:
+                if "x" in token and "+" in token:
+                    dims = token.split("+", 1)[0]
+                    if "x" in dims:
+                        try:
+                            w_str, h_str = dims.split("x", 1)
+                            w = int(w_str)
+                            h = int(h_str)
+                            if w > 0 and h > 0:
+                                return w / h
+                        except (TypeError, ValueError):
+                            pass
+    return None

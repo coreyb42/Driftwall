@@ -146,6 +146,7 @@ def apply_overlay(
     quadrant: str,
     font_path: str,
     output_path: Path,
+    target_aspect_ratio: float | None = None,
 ) -> Path:
     """
     Render *text* over a copy of *image_path* in the chosen quadrant.
@@ -165,6 +166,21 @@ def apply_overlay(
             orig = orig.convert("RGB")
         w, h = orig.size
 
+    # Visible region after center-crop to display aspect ratio (GNOME zoom-like behavior).
+    vis_x0, vis_y0, vis_x1, vis_y1 = 0, 0, w, h
+    if target_aspect_ratio and target_aspect_ratio > 0:
+        image_aspect = w / h if h else 0
+        if image_aspect > target_aspect_ratio:
+            # Image is wider than display; horizontal sides get cropped.
+            vis_w = int(h * target_aspect_ratio)
+            crop_x = max(0, (w - vis_w) // 2)
+            vis_x0, vis_x1 = crop_x, crop_x + vis_w
+        elif image_aspect < target_aspect_ratio:
+            # Image is taller than display; top/bottom get cropped.
+            vis_h = int(w / target_aspect_ratio)
+            crop_y = max(0, (h - vis_h) // 2)
+            vis_y0, vis_y1 = crop_y, crop_y + vis_h
+
     # ── font ─────────────────────────────────────────────────────────────────
     font_size = max(28, int(min(w, h) * 0.042))
     resolved = _resolve_font(font_path)
@@ -179,8 +195,10 @@ def apply_overlay(
         font = ImageFont.load_default(size=font_size)
 
     # ── wrap target width ────────────────────────────────────────────────────
-    pad = int(min(w, h) * 0.045)
-    max_text_w = max(220, int(w * 0.42))
+    vis_w = vis_x1 - vis_x0
+    vis_h = vis_y1 - vis_y0
+    pad = int(min(vis_w, vis_h) * 0.045)
+    max_text_w = max(220, int(vis_w * 0.42))
 
     # ── word-wrap ─────────────────────────────────────────────────────────────
     # Estimate character width from the font; getlength is more accurate than bbox.
@@ -196,6 +214,17 @@ def apply_overlay(
         lines.extend(wrapped if wrapped else [""])
 
     line_h = int(font_size * 1.45)
+    corner_margin = pad
+    bg_pad = int(font_size * 0.5)
+
+    # Keep overlay fully inside the image bounds.
+    max_text_h = max(line_h, vis_h - (2 * corner_margin) - (2 * bg_pad))
+    max_lines = max(1, max_text_h // line_h)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        if lines:
+            lines[-1] = lines[-1].rstrip(" .,:;") + "..."
+
     total_text_h = len(lines) * line_h
 
     # Measure block width so the scrim hugs text instead of spanning the quadrant.
@@ -212,22 +241,21 @@ def apply_overlay(
     text_block_h = total_text_h
 
     # Place block near selected corner.
-    corner_margin = pad
     if quadrant == "top-left":
-        text_x = corner_margin
-        text_y = corner_margin
+        text_x = vis_x0 + corner_margin
+        text_y = vis_y0 + corner_margin
     elif quadrant == "top-right":
-        text_x = w - corner_margin - text_block_w
-        text_y = corner_margin
+        text_x = vis_x1 - corner_margin - text_block_w
+        text_y = vis_y0 + corner_margin
     elif quadrant == "bottom-left":
-        text_x = corner_margin
-        text_y = h - corner_margin - text_block_h
+        text_x = vis_x0 + corner_margin
+        text_y = vis_y1 - corner_margin - text_block_h
     else:  # bottom-right (default)
-        text_x = w - corner_margin - text_block_w
-        text_y = h - corner_margin - text_block_h
+        text_x = vis_x1 - corner_margin - text_block_w
+        text_y = vis_y1 - corner_margin - text_block_h
 
-    text_x = max(corner_margin, text_x)
-    text_y = max(corner_margin, text_y)
+    text_x = max(vis_x0 + corner_margin, min(text_x, vis_x1 - corner_margin - text_block_w))
+    text_y = max(vis_y0 + corner_margin, min(text_y, vis_y1 - corner_margin - text_block_h))
 
     # ── compositing ──────────────────────────────────────────────────────────
     # Re-open to avoid mutating the cached object inside the context manager.
@@ -240,7 +268,6 @@ def apply_overlay(
             orig = orig.convert("RGB")
 
         # Semi-transparent dark scrim behind the text block for readability.
-        bg_pad = int(font_size * 0.5)
         scrim_box = (
             text_x - bg_pad,
             text_y - bg_pad,

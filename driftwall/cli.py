@@ -14,7 +14,7 @@ from .overlay import apply_overlay, generate_overlay_text
 from .scanner import scan_directory
 from .selector import select_image
 from .triggers import FilterCriteria, get_active_triggers, merge_criteria
-from .wallpaper import WallpaperError, set_wallpaper
+from .wallpaper import WallpaperError, get_display_aspect_ratio, set_wallpaper
 
 
 def _setup_logging(verbose: bool = False) -> None:
@@ -119,6 +119,7 @@ def cmd_rotate(args: argparse.Namespace) -> int:
                     quadrant=config.overlay.quadrant,
                     font_path=config.overlay.font_path,
                     output_path=cache_path,
+                    target_aspect_ratio=get_display_aspect_ratio(),
                 )
                 logging.info("Overlay applied: %s", text.replace("\n", " / "))
 
