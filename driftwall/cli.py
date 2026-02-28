@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .config import load_config
 from .db import get_stats, init_db
-from .overlay import apply_overlay, generate_overlay_text
+from .overlay import apply_overlay, generate_overlay_text, pick_overlay_font, scan_font_dir
 from .scanner import scan_directory
 from .selector import select_image
 from .triggers import FilterCriteria, get_active_triggers, merge_criteria
@@ -112,12 +112,24 @@ def cmd_rotate(args: argparse.Namespace) -> int:
                 num_predict=config.ollama.num_predict,
             )
             if text:
+                font_file = config.overlay.font_file
+                if config.overlay.font_dir:
+                    font_paths = scan_font_dir(config.overlay.font_dir)
+                    if font_paths:
+                        chosen = pick_overlay_font(
+                            font_paths=font_paths,
+                            context=text,
+                            model=overlay_model,
+                            host=config.ollama.host,
+                        )
+                        font_file = str(chosen)
+                        logging.info("Overlay font chosen: %s", chosen.name)
                 cache_path = Path.home() / ".cache" / "driftwall" / "overlay.jpg"
                 wallpaper_path = apply_overlay(
                     image_path=path,
                     text=text,
                     quadrant=config.overlay.quadrant,
-                    font_path=config.overlay.font_path,
+                    font_file=font_file,
                     output_path=cache_path,
                     target_aspect_ratio=get_display_aspect_ratio(),
                 )
@@ -221,9 +233,32 @@ def cmd_config(args: argparse.Namespace) -> int:
     print(f"  prompt:      {config.overlay.prompt}")
     print(f"  model:       {config.overlay.model or '(same as ollama.model)'}")
     print(f"  quadrant:    {config.overlay.quadrant}")
-    print(f"  font_path:   {config.overlay.font_path or '(auto)'}")
+    print(f"  font_file:   {config.overlay.font_file or '(auto)'}")
+    print(f"  font_dir:    {config.overlay.font_dir or '(none)'}")
 
     return 0
+
+
+def cmd_ui(args: argparse.Namespace) -> int:
+    import os
+    import sys
+    import driftwall as _dw
+    from pathlib import Path
+
+    # The editable install uses a path-hook finder that system python3 won't load
+    # via PYTHONPATH, so we add the project root explicitly alongside the venv's
+    # site-packages (for ollama, PIL, tomli_w, etc.).
+    project_root = str(Path(_dw.__file__).parent.parent)
+    site_pkgs = [p for p in sys.path if "site-packages" in p]
+    python_path = os.pathsep.join([project_root] + site_pkgs)
+    env = {**os.environ, "PYTHONPATH": python_path}
+
+    cmd = ["/usr/bin/python3", "-m", "driftwall.ui"]
+    if args.config:
+        cmd += ["--config", str(args.config)]
+
+    os.execve("/usr/bin/python3", cmd, env)
+    return 0  # unreachable
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -263,6 +298,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_config = sub.add_parser("config", help="Print resolved configuration")
     p_config.add_argument("--show-path", action="store_true", help="Print config file path only")
 
+    # ui
+    sub.add_parser("ui", help="Launch system tray UI (GTK3)")
+
     return parser
 
 
@@ -277,6 +315,7 @@ def main() -> None:
         "daemon": cmd_daemon,
         "status": cmd_status,
         "config": cmd_config,
+        "ui": cmd_ui,
     }
 
     handler = handlers.get(args.command)
