@@ -62,7 +62,8 @@ class OverlayConfig:
     enabled: bool = False
     prompt: str = "a haiku"
     model: str = "lfm2.5-thinking"
-    font_path: str = ""  # empty = auto-detect
+    font_file: str = ""   # path to a specific font file; empty = auto-detect from system candidates
+    font_dir: str = ""    # directory to scan recursively for .ttf fonts; LLM picks one
     quadrant: str = "bottom-right"  # top-left, top-right, bottom-left, bottom-right
 
 
@@ -149,7 +150,8 @@ def load_config(path: Path | None = None) -> Config:
         enabled=overlay_raw.get("enabled", False),
         prompt=overlay_raw.get("prompt", "a haiku"),
         model=overlay_raw.get("model", "lfm2.5-thinking"),
-        font_path=overlay_raw.get("font_path", ""),
+        font_file=overlay_raw.get("font_file", ""),
+        font_dir=overlay_raw.get("font_dir", ""),
         quadrant=overlay_raw.get("quadrant", "bottom-right"),
     )
 

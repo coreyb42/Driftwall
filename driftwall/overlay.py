@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import re
 import textwrap
 from pathlib import Path
@@ -35,14 +36,87 @@ _WRAPPER_LINE_RE = re.compile(
 )
 
 
-def _resolve_font(font_path: str) -> str | None:
+def _resolve_font(font_file: str) -> str | None:
     """Return the first usable font path, or None to fall back to Pillow default."""
-    if font_path and Path(font_path).exists():
-        return font_path
+    if font_file and Path(font_file).exists():
+        return font_file
     for candidate in _FONT_CANDIDATES:
         if Path(candidate).exists():
             return candidate
     return None
+
+
+def scan_font_dir(font_dir: str) -> list[Path]:
+    """Recursively find all .ttf font files under font_dir."""
+    if not font_dir:
+        return []
+    d = Path(font_dir)
+    if not d.is_dir():
+        logger.warning("overlay.font_dir does not exist or is not a directory: %s", font_dir)
+        return []
+    fonts = sorted(d.rglob("*.ttf"))
+    logger.debug("Found %d .ttf fonts in %s", len(fonts), font_dir)
+    return fonts
+
+
+def pick_overlay_font(font_paths: list[Path], context: str, model: str, host: str) -> Path:
+    """Ask the LLM to pick a font from font_paths that suits the overlay text.
+
+    Retries once if the first choice is invalid, then falls back to random.
+    """
+    if len(font_paths) == 1:
+        return font_paths[0]
+
+    try:
+        import ollama  # type: ignore[import]
+    except ImportError:
+        logger.warning("ollama not available; choosing font randomly")
+        return random.choice(font_paths)
+
+    name_map = {p.stem: p for p in font_paths}
+    names_str = ", ".join(name_map)
+
+    def _ask(prompt: str) -> str:
+        try:
+            client = ollama.Client(host=host)
+            resp = client.generate(
+                model=model,
+                prompt=prompt,
+                think=False,
+                options={"num_predict": 50},
+            )
+            text = (resp.response if not isinstance(resp, dict) else resp.get("response", "")) or ""
+            return text.strip()
+        except Exception as e:
+            logger.warning("Font selection LLM call failed: %s", e)
+            return ""
+
+    prompt = (
+        f"Given this overlay text, choose the font whose name best matches the mood and style.\n\n"
+        f"Overlay text:\n{context}\n\n"
+        f"Available fonts: {names_str}\n\n"
+        f"Output ONLY the exact font name from the list, nothing else."
+    )
+    choice = _ask(prompt)
+
+    if choice in name_map:
+        logger.debug("LLM chose font: %s", choice)
+        return name_map[choice]
+
+    retry_prompt = (
+        f"'{choice}' is not a valid font name. Choose from: {names_str}\n\n"
+        f"Output ONLY the exact font name from the list, nothing else."
+    )
+    choice2 = _ask(retry_prompt)
+
+    if choice2 in name_map:
+        logger.debug("LLM chose font on retry: %s", choice2)
+        return name_map[choice2]
+
+    logger.warning(
+        "Font selection failed (got %r then %r); choosing randomly", choice, choice2
+    )
+    return random.choice(font_paths)
 
 
 def _sanitize_overlay_text(text: str) -> str:
@@ -144,7 +218,7 @@ def apply_overlay(
     image_path: Path,
     text: str,
     quadrant: str,
-    font_path: str,
+    font_file: str,
     output_path: Path,
     target_aspect_ratio: float | None = None,
 ) -> Path:
@@ -183,7 +257,7 @@ def apply_overlay(
 
     # ── font ─────────────────────────────────────────────────────────────────
     font_size = max(28, int(min(w, h) * 0.042))
-    resolved = _resolve_font(font_path)
+    resolved = _resolve_font(font_file)
     if resolved:
         try:
             font = ImageFont.truetype(resolved, font_size)
