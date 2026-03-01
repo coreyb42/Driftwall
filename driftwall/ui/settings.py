@@ -143,6 +143,8 @@ class SettingsDialog(Gtk.Dialog):
         self._build_ollama_tab()
         self._build_filters_tab()
         self._build_overlay_tab()
+        self._build_content_tab()
+        self._build_download_tab()
 
         self.add_button("Cancel", Gtk.ResponseType.CANCEL)
         save_btn = self.add_button("Save", Gtk.ResponseType.OK)
@@ -341,6 +343,113 @@ class SettingsDialog(Gtk.Dialog):
             self._overlay_font_dir.set_filename(font_dir)
         box.pack_start(_row("Font directory", self._overlay_font_dir), False, False, 0)
 
+    def _build_content_tab(self) -> None:
+        box = self._tab_box("Content")
+        ct = self._raw.get("content", {})
+        dyn = self._raw.get("dynamic_overlay", {})
+
+        # ── Content ingestion ─────────────────────────────────────────────────
+        section_lbl = Gtk.Label(xalign=0.0)
+        section_lbl.set_markup("<b>Content ingestion</b>")
+        box.pack_start(section_lbl, False, False, 0)
+
+        ct_switch_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        ct_switch_lbl = Gtk.Label(label="Enabled", xalign=1.0)
+        ct_switch_lbl.set_width_chars(24)
+        self._content_enabled = Gtk.Switch()
+        self._content_enabled.set_active(ct.get("enabled", False))
+        ct_switch_box.pack_start(ct_switch_lbl, False, False, 0)
+        ct_switch_box.pack_start(self._content_enabled, False, False, 0)
+        box.pack_start(ct_switch_box, False, False, 0)
+
+        default_content_dir = str(Path.home() / "Documents" / "driftwall-content")
+        self._content_dir = Gtk.FileChooserButton(
+            title="Select content directory",
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        current_content_dir = ct.get("content_dir", default_content_dir)
+        Path(current_content_dir).expanduser().mkdir(parents=True, exist_ok=True)
+        self._content_dir.set_filename(str(Path(current_content_dir).expanduser()))
+        box.pack_start(_row("Content directory", self._content_dir), False, False, 0)
+
+        self._chroma_path_entry = Gtk.Entry()
+        self._chroma_path_entry.set_placeholder_text(
+            "(default: ~/.local/share/driftwall/chromadb)"
+        )
+        self._chroma_path_entry.set_text(ct.get("chroma_path") or "")
+        box.pack_start(_row("ChromaDB path (optional)", self._chroma_path_entry), False, False, 0)
+
+        self._embed_model_entry = Gtk.Entry()
+        self._embed_model_entry.set_text(ct.get("embed_model", "nomic-embed-text"))
+        box.pack_start(_row("Embed model", self._embed_model_entry), False, False, 0)
+
+        box.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 4)
+
+        # ── Dynamic overlay ───────────────────────────────────────────────────
+        dyn_section_lbl = Gtk.Label(xalign=0.0)
+        dyn_section_lbl.set_markup("<b>Dynamic overlays</b>")
+        box.pack_start(dyn_section_lbl, False, False, 0)
+
+        dyn_switch_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        dyn_switch_lbl = Gtk.Label(label="Enabled", xalign=1.0)
+        dyn_switch_lbl.set_width_chars(24)
+        self._dyn_enabled = Gtk.Switch()
+        self._dyn_enabled.set_active(dyn.get("enabled", False))
+        dyn_switch_box.pack_start(dyn_switch_lbl, False, False, 0)
+        dyn_switch_box.pack_start(self._dyn_enabled, False, False, 0)
+        box.pack_start(dyn_switch_box, False, False, 0)
+
+        self._dyn_max_simultaneous = _spin(dyn.get("max_simultaneous", 3), 1, 10)
+        box.pack_start(_row("Max simultaneous", self._dyn_max_simultaneous), False, False, 0)
+
+        self._dyn_spawn_interval = _spin(dyn.get("spawn_interval_seconds", 20), 5, 600)
+        box.pack_start(_row("Spawn interval (s)", self._dyn_spawn_interval), False, False, 0)
+
+        self._dyn_min_lifetime = _spin(dyn.get("min_lifetime_seconds", 30), 5, 300)
+        box.pack_start(_row("Min lifetime (s)", self._dyn_min_lifetime), False, False, 0)
+
+        self._dyn_max_lifetime = _spin(dyn.get("max_lifetime_seconds", 90), 10, 600)
+        box.pack_start(_row("Max lifetime (s)", self._dyn_max_lifetime), False, False, 0)
+
+        self._dyn_font_size = _spin(dyn.get("font_size", 18), 8, 72)
+        box.pack_start(_row("Font size (px)", self._dyn_font_size), False, False, 0)
+
+        self._dyn_max_fraction = _spin(
+            float(dyn.get("max_screen_fraction", 0.10)), 0.05, 0.50, step=0.05, digits=2
+        )
+        box.pack_start(_row("Max screen fraction", self._dyn_max_fraction), False, False, 0)
+
+        self._dyn_font_file = Gtk.FileChooserButton(
+            title="Select font file for dynamic overlays",
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dyn_font = dyn.get("font_file", "")
+        if dyn_font:
+            self._dyn_font_file.set_filename(dyn_font)
+        box.pack_start(_row("Font file (optional)", self._dyn_font_file), False, False, 0)
+
+    def _build_download_tab(self) -> None:
+        box = self._tab_box("Download")
+        dl = self._raw.get("download", {})
+
+        default_dir = str(Path.home() / "Pictures" / "driftwall-downloads")
+        self._download_output_dir = Gtk.FileChooserButton(
+            title="Select download directory",
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        current_dir = dl.get("output_dir", default_dir)
+        # FileChooserButton requires the directory to exist to set it
+        Path(current_dir).expanduser().mkdir(parents=True, exist_ok=True)
+        self._download_output_dir.set_filename(str(Path(current_dir).expanduser()))
+        box.pack_start(_row("Download directory", self._download_output_dir), False, False, 0)
+
+        hint = Gtk.Label(xalign=0.0)
+        hint.set_markup(
+            "<small>Images are saved into source-specific subfolders inside this directory.\n"
+            "e.g. <i>download_dir/met/dept-11/</i> or <i>download_dir/met/landscape/</i></small>"
+        )
+        box.pack_start(hint, False, False, 0)
+
     # ── save ─────────────────────────────────────────────────────────────────
 
     def _on_response(self, _dialog: Gtk.Dialog, response: int) -> None:
@@ -431,6 +540,38 @@ class SettingsDialog(Gtk.Dialog):
             "font_file": self._overlay_font_file.get_filename() or "",
             "font_dir": self._overlay_font_dir.get_filename() or "",
         }
+
+        # Content
+        content_dir = self._content_dir.get_filename() or ""
+        chroma_path_text = self._chroma_path_entry.get_text().strip()
+        data["content"] = {
+            **data.get("content", {}),
+            "enabled": self._content_enabled.get_active(),
+            "content_dir": content_dir,
+            "embed_model": self._embed_model_entry.get_text().strip() or "nomic-embed-text",
+        }
+        if chroma_path_text:
+            data["content"]["chroma_path"] = chroma_path_text
+        else:
+            data["content"].pop("chroma_path", None)
+
+        # Dynamic overlay
+        data["dynamic_overlay"] = {
+            **data.get("dynamic_overlay", {}),
+            "enabled": self._dyn_enabled.get_active(),
+            "max_simultaneous": int(self._dyn_max_simultaneous.get_value()),
+            "spawn_interval_seconds": int(self._dyn_spawn_interval.get_value()),
+            "min_lifetime_seconds": int(self._dyn_min_lifetime.get_value()),
+            "max_lifetime_seconds": int(self._dyn_max_lifetime.get_value()),
+            "font_size": int(self._dyn_font_size.get_value()),
+            "max_screen_fraction": round(self._dyn_max_fraction.get_value(), 2),
+            "font_file": self._dyn_font_file.get_filename() or "",
+        }
+
+        # Download
+        dl_dir = self._download_output_dir.get_filename()
+        if dl_dir:
+            data["download"] = {**data.get("download", {}), "output_dir": dl_dir}
 
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         self.config_path.write_text(tomli_w.dumps(data))
