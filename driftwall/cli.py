@@ -30,52 +30,92 @@ def cmd_scan(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     db_path = config.resolved_db_path
 
+    # Determine what to scan. Default (no flags) = images only for backward compat.
+    do_images = getattr(args, "images", False) or not getattr(args, "content", False)
+    do_content = getattr(args, "content", False)
+
     if args.dry_run:
         print("(dry run — no writes)")
 
-    total_result = None
-    for image_dir in config.image_dirs:
-        print(f"Scanning: {image_dir}")
+    if do_images:
+        total_result = None
+        for image_dir in config.image_dirs:
+            print(f"Scanning images: {image_dir}")
 
-        def progress(done: int, total: int) -> None:
-            print(f"\r  {done}/{total}", end="", flush=True)
+            def progress(done: int, total: int) -> None:
+                print(f"\r  {done}/{total}", end="", flush=True)
 
-        result = scan_directory(
-            image_dir=image_dir,
-            db_path=db_path,
-            config=config,
-            force_reclassify=args.force,
-            dry_run=args.dry_run,
-            progress_callback=progress,
-        )
-        print()  # newline after progress
-        print(
-            f"  Done in {result.duration_seconds:.1f}s — "
-            f"found={result.total_found} "
-            f"new={result.newly_classified} "
-            f"cached={result.already_classified} "
-            f"errors={result.skipped_errors}"
-        )
-
-        if total_result is None:
-            total_result = result
-        else:
-            from .scanner import ScanResult
-            total_result = ScanResult(
-                total_found=total_result.total_found + result.total_found,
-                newly_classified=total_result.newly_classified + result.newly_classified,
-                already_classified=total_result.already_classified + result.already_classified,
-                skipped_errors=total_result.skipped_errors + result.skipped_errors,
-                duration_seconds=total_result.duration_seconds + result.duration_seconds,
+            result = scan_directory(
+                image_dir=image_dir,
+                db_path=db_path,
+                config=config,
+                force_reclassify=args.force,
+                dry_run=args.dry_run,
+                progress_callback=progress,
+            )
+            print()  # newline after progress
+            print(
+                f"  Done in {result.duration_seconds:.1f}s — "
+                f"found={result.total_found} "
+                f"new={result.newly_classified} "
+                f"cached={result.already_classified} "
+                f"errors={result.skipped_errors}"
             )
 
-    if total_result and len(config.image_dirs) > 1:
-        print(
-            f"Total: found={total_result.total_found} "
-            f"new={total_result.newly_classified} "
-            f"cached={total_result.already_classified} "
-            f"errors={total_result.skipped_errors}"
-        )
+            if total_result is None:
+                total_result = result
+            else:
+                from .scanner import ScanResult
+                total_result = ScanResult(
+                    total_found=total_result.total_found + result.total_found,
+                    newly_classified=total_result.newly_classified + result.newly_classified,
+                    already_classified=total_result.already_classified + result.already_classified,
+                    skipped_errors=total_result.skipped_errors + result.skipped_errors,
+                    duration_seconds=total_result.duration_seconds + result.duration_seconds,
+                )
+
+        if total_result and len(config.image_dirs) > 1:
+            print(
+                f"Total: found={total_result.total_found} "
+                f"new={total_result.newly_classified} "
+                f"cached={total_result.already_classified} "
+                f"errors={total_result.skipped_errors}"
+            )
+
+    if do_content:
+        from .content_scanner import scan_content_dir
+        content_dir = config.content.content_dir
+        print(f"Scanning content: {content_dir}")
+
+        if not content_dir.exists():
+            print(f"  Content directory not found: {content_dir}", file=sys.stderr)
+        elif args.dry_run:
+            files = sorted(
+                f for f in content_dir.rglob("*")
+                if f.is_file() and f.suffix.lower() in (".txt", ".md", ".csv")
+            )
+            print(f"  Would index {len(files)} file(s) (dry run)")
+        else:
+            def content_progress(done: int, total: int) -> None:
+                print(f"\r  {done}/{total}", end="", flush=True)
+
+            result = scan_content_dir(
+                content_dir=content_dir,
+                db_path=db_path,
+                chroma_path=config.resolved_chroma_path,
+                config=config,
+                force_reindex=args.force,
+                progress_callback=content_progress,
+            )
+            print()
+            print(
+                f"  Done in {result.duration_seconds:.1f}s — "
+                f"found={result.total_found} "
+                f"new={result.newly_indexed} "
+                f"cached={result.already_indexed} "
+                f"errors={result.skipped_errors}"
+            )
+
     return 0
 
 
@@ -174,8 +214,9 @@ def cmd_rotate(args: argparse.Namespace) -> int:
 
 
 def cmd_daemon(args: argparse.Namespace) -> int:
+    cli_interval = args.interval  # explicit CLI override; None means "read from config"
     config = load_config(args.config)
-    interval = args.interval or config.rotation.interval_minutes
+    interval = cli_interval or config.rotation.interval_minutes
     print(f"Starting daemon (interval={interval}min). Ctrl+C to stop.")
 
     rotate_args = argparse.Namespace(
@@ -193,6 +234,12 @@ def cmd_daemon(args: argparse.Namespace) -> int:
             cmd_rotate(rotate_args)
         except Exception as e:
             logging.warning("Rotate failed: %s", e)
+        # Re-read interval from config each cycle so UI settings take effect immediately.
+        if not cli_interval:
+            try:
+                interval = load_config(args.config).rotation.interval_minutes
+            except Exception:
+                pass  # keep previous interval if config is temporarily unreadable
         time.sleep(interval * 60)
 
 
@@ -274,6 +321,90 @@ def cmd_config(args: argparse.Namespace) -> int:
         print(f"  quadrants:   {quadrants}")
     print(f"  font_file:   {config.overlay.font_file or '(auto)'}")
     print(f"  font_dir:    {config.overlay.font_dir or '(none)'}")
+    print()
+    print("[download]")
+    print(f"  output_dir:  {config.download.output_dir}")
+    print()
+    print("[content]")
+    print(f"  enabled:     {config.content.enabled}")
+    print(f"  content_dir: {config.content.content_dir}")
+    print(f"  chroma_path: {config.resolved_chroma_path}")
+    print(f"  embed_model: {config.content.embed_model}")
+    print()
+    print("[dynamic_overlay]")
+    print(f"  enabled:             {config.dynamic_overlay.enabled}")
+    print(f"  max_simultaneous:    {config.dynamic_overlay.max_simultaneous}")
+    print(f"  min_lifetime:        {config.dynamic_overlay.min_lifetime_seconds}s")
+    print(f"  max_lifetime:        {config.dynamic_overlay.max_lifetime_seconds}s")
+    print(f"  spawn_interval:      {config.dynamic_overlay.spawn_interval_seconds}s")
+    print(f"  font_size:           {config.dynamic_overlay.font_size}px")
+    print(f"  max_screen_fraction: {config.dynamic_overlay.max_screen_fraction}")
+    print(f"  font_file:           {config.dynamic_overlay.font_file or '(auto)'}")
+
+    return 0
+
+
+def cmd_fetch(args: argparse.Namespace) -> int:
+    from .downloader import download_met_artworks, met_list_departments, met_output_subdir
+
+    if args.source != "met":
+        print(f"Unknown source: {args.source}", file=sys.stderr)
+        return 1
+
+    if args.list_departments:
+        depts = met_list_departments()
+        for d in depts:
+            print(f"  {d['departmentId']:>4}  {d['displayName']}")
+        return 0
+
+    if args.department is None and args.search is None:
+        print(
+            "Error: specify --department, --search, or --list-departments",
+            file=sys.stderr,
+        )
+        return 1
+
+    config = load_config(args.config)
+    base_dir = args.output_dir or config.download.output_dir
+    output_dir = met_output_subdir(
+        base_dir,
+        department_id=args.department,
+        search_query=args.search,
+    )
+
+    from datetime import datetime
+    t_start = time.monotonic()
+    started_at = datetime.now().strftime("%H:%M:%S")
+    print(f"Started at {started_at}", flush=True)
+
+    result = download_met_artworks(
+        output_dir=output_dir,
+        department_id=args.department,
+        search_query=args.search,
+        limit=args.limit,
+        dry_run=args.dry_run,
+        request_delay=1.0,
+        progress_callback=lambda msg: print(msg, flush=True),
+    )
+
+    elapsed = time.monotonic() - t_start
+    finished_at = datetime.now().strftime("%H:%M:%S")
+    mins, secs = divmod(int(elapsed), 60)
+    elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+
+    print(flush=True)
+    print(f"Started:                   {started_at}", flush=True)
+    print(f"Finished:                  {finished_at}  (elapsed: {elapsed_str})", flush=True)
+    print(flush=True)
+    print(f"Downloaded:                {result.downloaded}", flush=True)
+    print(f"Skipped (not landscape):   {result.skipped_not_landscape}", flush=True)
+    print(f"Skipped (no image/rights): {result.skipped_no_image}", flush=True)
+    print(f"Skipped (already exist):   {result.skipped_existing}", flush=True)
+    print(f"Errors:                    {result.errors}", flush=True)
+
+    if result.downloaded > 0 and not args.dry_run:
+        print(f"\nImages saved to: {output_dir}", flush=True)
+        print("Run 'driftwall scan' to classify the new images.", flush=True)
 
     return 0
 
@@ -314,9 +445,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # scan
-    p_scan = sub.add_parser("scan", help="Classify new images in image_dir")
-    p_scan.add_argument("--force", action="store_true", help="Re-classify all images")
-    p_scan.add_argument("--dry-run", action="store_true", help="List images without writing")
+    p_scan = sub.add_parser("scan", help="Classify new images and/or index content")
+    p_scan.add_argument("--force", action="store_true", help="Re-classify/re-index regardless of cache")
+    p_scan.add_argument("--dry-run", action="store_true", help="List files without writing")
+    p_scan.add_argument("--images", action="store_true", help="Scan image directories (explicit)")
+    p_scan.add_argument("--content", action="store_true", help="Scan content directory for quotes/text")
 
     # rotate
     p_rotate = sub.add_parser("rotate", help="Select and set wallpaper once")
@@ -337,6 +470,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_config = sub.add_parser("config", help="Print resolved configuration")
     p_config.add_argument("--show-path", action="store_true", help="Print config file path only")
 
+    # fetch
+    p_fetch = sub.add_parser("fetch", help="Download artworks from external art APIs")
+    p_fetch.add_argument("--source", default="met", choices=["met"], help="Art collection source (default: met)")
+    p_fetch.add_argument("--list-departments", action="store_true", help="List available Met departments and exit")
+    p_fetch.add_argument("--department", type=int, metavar="ID", help="Met department ID to fetch from")
+    p_fetch.add_argument("--search", metavar="QUERY", help="Search query string")
+    p_fetch.add_argument("--limit", type=int, default=50, metavar="N", help="Max landscape images to save (default: 50)")
+    p_fetch.add_argument("--output-dir", type=Path, metavar="DIR", help="Directory to save images (default: from config)")
+    p_fetch.add_argument("--dry-run", action="store_true", help="Log without writing files")
+
     # ui
     sub.add_parser("ui", help="Launch system tray UI (GTK3)")
 
@@ -354,6 +497,7 @@ def main() -> None:
         "daemon": cmd_daemon,
         "status": cmd_status,
         "config": cmd_config,
+        "fetch": cmd_fetch,
         "ui": cmd_ui,
     }
 
