@@ -35,8 +35,11 @@ def _find_driftwall_bin() -> str:
 class DriftwallApp:
     def __init__(self, config_path: str | None = None) -> None:
         self.config_path = config_path
-        self._scan_item: Gtk.MenuItem | None = None
-        self._scan_running = False
+        self._scan_images_item: Gtk.MenuItem | None = None
+        self._scan_content_item: Gtk.MenuItem | None = None
+        self._scan_images_running = False
+        self._scan_content_running = False
+        self._overlay_manager = None
 
     def setup(self) -> None:
         """Create the AppIndicator and tray menu."""
@@ -49,6 +52,18 @@ class DriftwallApp:
         self.indicator.set_title("Driftwall")
         self.indicator.set_menu(self._build_menu())
 
+        # Dynamic content overlays (optional)
+        try:
+            from driftwall.config import load_config
+            config = load_config(Path(self.config_path) if self.config_path else None)
+            if config.dynamic_overlay.enabled and config.content.enabled:
+                from driftwall.dynamic_overlay import DynamicOverlayManager
+                self._overlay_manager = DynamicOverlayManager(config, config.resolved_db_path)
+                self._overlay_manager.start()
+                self._seed_overlay_manager_from_history(config)
+        except Exception as e:
+            log.warning("Dynamic overlay init failed: %s", e)
+
     def _build_menu(self) -> Gtk.Menu:
         menu = Gtk.Menu()
 
@@ -58,10 +73,26 @@ class DriftwallApp:
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        scan_item = Gtk.MenuItem(label="Scan Images")
-        scan_item.connect("activate", self._on_scan)
+        scan_item = Gtk.MenuItem(label="Scan")
+        scan_submenu = Gtk.Menu()
+
+        scan_images_item = Gtk.MenuItem(label="Images")
+        scan_images_item.connect("activate", self._on_scan_images)
+        scan_submenu.append(scan_images_item)
+        self._scan_images_item = scan_images_item
+
+        scan_content_item = Gtk.MenuItem(label="Content")
+        scan_content_item.connect("activate", self._on_scan_content)
+        scan_submenu.append(scan_content_item)
+        self._scan_content_item = scan_content_item
+
+        scan_submenu.show_all()
+        scan_item.set_submenu(scan_submenu)
         menu.append(scan_item)
-        self._scan_item = scan_item
+
+        fetch_item = Gtk.MenuItem(label="Fetch Artworks…")
+        fetch_item.connect("activate", self._on_fetch)
+        menu.append(fetch_item)
 
         status_item = Gtk.MenuItem(label="Status")
         status_item.connect("activate", self._on_status)
@@ -92,8 +123,10 @@ class DriftwallApp:
         self,
         args: list[str],
         on_done: "callable[[bool], None] | None" = None,
+        log_path: "Path | None" = None,
     ) -> None:
         """Run driftwall subcommand in a background thread; call on_done on the GLib main loop."""
+        import datetime
         try:
             proc = subprocess.Popen(
                 self._base_cmd() + args,
@@ -103,15 +136,40 @@ class DriftwallApp:
             )
         except OSError as e:
             log.error("Failed to launch driftwall %s: %s", " ".join(args), e)
+            if log_path:
+                try:
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    log_path.write_text(f"Failed to launch: {e}\n")
+                except OSError:
+                    pass
             if on_done:
                 GLib.idle_add(on_done, False)
             return
 
         def _reader() -> None:
             assert proc.stdout is not None
-            for line in proc.stdout:
-                log.info("[driftwall %s] %s", " ".join(args), line.rstrip())
-            proc.wait()
+            log_file = None
+            if log_path:
+                try:
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    log_file = open(log_path, "w", buffering=1)
+                    log_file.write(f"=== driftwall {' '.join(args)} ===\n")
+                    log_file.write(f"Started: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                except OSError as e:
+                    log.warning("Cannot open scan log %s: %s", log_path, e)
+                    log_file = None
+            try:
+                for line in proc.stdout:
+                    log.info("[driftwall %s] %s", " ".join(args), line.rstrip())
+                    if log_file:
+                        log_file.write(line)
+                proc.wait()
+                if log_file:
+                    log_file.write(f"\nFinished: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                    log_file.write(f"  (exit code: {proc.returncode})\n")
+            finally:
+                if log_file:
+                    log_file.close()
             if on_done:
                 GLib.idle_add(on_done, proc.returncode == 0)
 
@@ -120,33 +178,99 @@ class DriftwallApp:
     # ── menu callbacks ───────────────────────────────────────────────────────
 
     def _on_next_wallpaper(self, _item: Gtk.MenuItem) -> None:
-        self._run_async(["rotate", "--no-triggers"])
+        def _done(success: bool) -> None:
+            if success and self._overlay_manager is not None:
+                self._update_overlay_manager()
 
-    def _on_scan(self, _item: Gtk.MenuItem) -> None:
-        if self._scan_running:
+        self._run_async(["rotate", "--no-triggers"], on_done=_done)
+
+    def _update_overlay_manager(self) -> None:
+        """Query DB for the latest shown image and pass it to the overlay manager."""
+        try:
+            from driftwall.config import load_config
+            from driftwall.db import get_latest_shown_image
+            config = load_config(Path(self.config_path) if self.config_path else None)
+            image = get_latest_shown_image(config.resolved_db_path)
+            if image and self._overlay_manager is not None:
+                self._overlay_manager.set_image(image)
+        except Exception as e:
+            log.warning("Failed to update overlay manager: %s", e)
+
+    def _seed_overlay_manager_from_history(self, config) -> None:
+        """Seed the overlay manager with the most recently shown image."""
+        try:
+            from driftwall.db import get_latest_shown_image
+            image = get_latest_shown_image(config.resolved_db_path)
+            if image and self._overlay_manager is not None:
+                self._overlay_manager.set_image(image)
+        except Exception as e:
+            log.warning("Failed to seed overlay manager: %s", e)
+
+    def _update_scan_indicator(self) -> None:
+        """Show a pulsing label on the tray icon while any scan is running."""
+        scanning = self._scan_images_running or self._scan_content_running
+        self.indicator.set_label("⟳" if scanning else "", "⟳")
+
+    def _on_scan_images(self, _item: Gtk.MenuItem) -> None:
+        if self._scan_images_running:
             return
-        self._scan_running = True
-        if self._scan_item:
-            self._scan_item.set_sensitive(False)
-            self._scan_item.set_label("Scanning…")
+        self._scan_images_running = True
+        if self._scan_images_item:
+            self._scan_images_item.set_sensitive(False)
+            self._scan_images_item.set_label("Images (scanning…)")
+        self._update_scan_indicator()
 
         def _done(success: bool) -> None:
-            self._scan_running = False
-            if self._scan_item:
-                self._scan_item.set_sensitive(True)
-                self._scan_item.set_label("Scan Images")
-            msg = "Scan complete." if success else "Scan failed — check logs."
+            self._scan_images_running = False
+            if self._scan_images_item:
+                self._scan_images_item.set_sensitive(True)
+                self._scan_images_item.set_label("Images")
+            self._update_scan_indicator()
+            msg = "Image scan complete." if success else "Image scan failed — check logs."
             try:
                 subprocess.Popen(["notify-send", "Driftwall", msg])
             except FileNotFoundError:
                 pass
 
-        self._run_async(["scan"], on_done=_done)
+        _log = Path.home() / ".local" / "share" / "driftwall" / "scan-images.log"
+        self._run_async(["scan", "--images"], on_done=_done, log_path=_log)
+
+    def _on_scan_content(self, _item: Gtk.MenuItem) -> None:
+        if self._scan_content_running:
+            return
+        self._scan_content_running = True
+        if self._scan_content_item:
+            self._scan_content_item.set_sensitive(False)
+            self._scan_content_item.set_label("Content (scanning…)")
+        self._update_scan_indicator()
+
+        def _done(success: bool) -> None:
+            self._scan_content_running = False
+            if self._scan_content_item:
+                self._scan_content_item.set_sensitive(True)
+                self._scan_content_item.set_label("Content")
+            self._update_scan_indicator()
+            msg = "Content scan complete." if success else "Content scan failed — check logs."
+            try:
+                subprocess.Popen(["notify-send", "Driftwall", msg])
+            except FileNotFoundError:
+                pass
+
+        _log = Path.home() / ".local" / "share" / "driftwall" / "scan-content.log"
+        self._run_async(["scan", "--content"], on_done=_done, log_path=_log)
 
     def _on_status(self, _item: Gtk.MenuItem) -> None:
         from driftwall.ui.status import StatusWindow
         win = StatusWindow(config_path=self.config_path)
         win.show_all()
+
+    def _on_fetch(self, _item: Gtk.MenuItem) -> None:
+        from driftwall.ui.fetch import FetchDialog
+        dialog = FetchDialog(
+            config_path=self.config_path,
+            driftwall_bin=_find_driftwall_bin(),
+        )
+        dialog.show_all()
 
     def _on_settings(self, _item: Gtk.MenuItem) -> None:
         from driftwall.ui.settings import SettingsDialog
