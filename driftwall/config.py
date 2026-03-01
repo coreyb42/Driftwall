@@ -68,6 +68,31 @@ class OverlayConfig:
 
 
 @dataclass
+class DownloadConfig:
+    output_dir: Path = field(default_factory=lambda: Path.home() / "Pictures" / "driftwall-downloads")
+
+
+@dataclass
+class ContentConfig:
+    enabled: bool = False
+    content_dir: Path = field(default_factory=lambda: Path.home() / "Documents" / "driftwall-content")
+    chroma_path: Path | None = None  # default: ~/.local/share/driftwall/chromadb
+    embed_model: str = "nomic-embed-text"
+
+
+@dataclass
+class DynamicOverlayConfig:
+    enabled: bool = False
+    max_simultaneous: int = 3
+    min_lifetime_seconds: int = 30
+    max_lifetime_seconds: int = 90
+    spawn_interval_seconds: int = 20
+    font_size: int = 18          # px
+    max_screen_fraction: float = 0.10
+    font_file: str = ""          # empty = auto-detect
+
+
+@dataclass
 class Config:
     image_dirs: list[Path] = field(default_factory=lambda: [Path.home() / "Pictures"])
     db_path: Path | None = None
@@ -77,6 +102,9 @@ class Config:
     filters: FilterConfig = field(default_factory=FilterConfig)
     triggers: TriggerConfig = field(default_factory=TriggerConfig)
     overlay: OverlayConfig = field(default_factory=OverlayConfig)
+    download: DownloadConfig = field(default_factory=DownloadConfig)
+    content: ContentConfig = field(default_factory=ContentConfig)
+    dynamic_overlay: DynamicOverlayConfig = field(default_factory=DynamicOverlayConfig)
 
     @property
     def resolved_db_path(self) -> Path:
@@ -85,6 +113,12 @@ class Config:
         # Central location — SQLite file locking doesn't work on
         # network/FUSE filesystems (Samba, NFS, etc.).
         return Path.home() / ".local" / "share" / "driftwall" / "driftwall.db"
+
+    @property
+    def resolved_chroma_path(self) -> Path:
+        if self.content.chroma_path is not None:
+            return self.content.chroma_path
+        return Path.home() / ".local" / "share" / "driftwall" / "chromadb"
 
 
 def _parse_time_of_day_map(raw: list[dict[str, Any]]) -> list[TimeOfDayMapping]:
@@ -172,6 +206,32 @@ def load_config(path: Path | None = None) -> Config:
         quadrants=overlay_quadrants,
     )
 
+    download_raw = raw.get("download", {})
+    download = DownloadConfig(
+        output_dir=Path(download_raw.get("output_dir", str(Path.home() / "Pictures" / "driftwall-downloads"))).expanduser(),
+    )
+
+    content_raw = raw.get("content", {})
+    chroma_path_raw = content_raw.get("chroma_path")
+    content = ContentConfig(
+        enabled=content_raw.get("enabled", False),
+        content_dir=Path(content_raw.get("content_dir", str(Path.home() / "Documents" / "driftwall-content"))).expanduser(),
+        chroma_path=Path(chroma_path_raw).expanduser() if chroma_path_raw else None,
+        embed_model=content_raw.get("embed_model", "nomic-embed-text"),
+    )
+
+    dyn_raw = raw.get("dynamic_overlay", {})
+    dynamic_overlay = DynamicOverlayConfig(
+        enabled=dyn_raw.get("enabled", False),
+        max_simultaneous=dyn_raw.get("max_simultaneous", 3),
+        min_lifetime_seconds=dyn_raw.get("min_lifetime_seconds", 30),
+        max_lifetime_seconds=dyn_raw.get("max_lifetime_seconds", 90),
+        spawn_interval_seconds=dyn_raw.get("spawn_interval_seconds", 20),
+        font_size=dyn_raw.get("font_size", 18),
+        max_screen_fraction=float(dyn_raw.get("max_screen_fraction", 0.10)),
+        font_file=dyn_raw.get("font_file", ""),
+    )
+
     return Config(
         image_dirs=image_dirs,
         db_path=db_path,
@@ -181,4 +241,7 @@ def load_config(path: Path | None = None) -> Config:
         filters=filters,
         triggers=triggers,
         overlay=overlay,
+        download=download,
+        content=content,
+        dynamic_overlay=dynamic_overlay,
     )

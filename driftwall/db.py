@@ -82,6 +82,14 @@ CREATE TABLE IF NOT EXISTS wallpaper_history (
     shown_at TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_history_shown ON wallpaper_history(shown_at DESC);
+
+CREATE TABLE IF NOT EXISTS content_sources (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_path TEXT NOT NULL UNIQUE,
+    file_hash   TEXT NOT NULL,
+    indexed_at  TEXT NOT NULL,
+    chunk_count INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -313,6 +321,70 @@ def get_recent_image_ids(db_path: Path, window: int) -> list[int]:
             (window,),
         ).fetchall()
     return [r[0] for r in rows]
+
+
+def get_content_source(db_path: Path, source_path: str) -> sqlite3.Row | None:
+    """Return the content_sources row for source_path, or None if not found."""
+    with _connect(db_path) as conn:
+        return conn.execute(
+            "SELECT * FROM content_sources WHERE source_path = ?", (source_path,)
+        ).fetchone()
+
+
+def upsert_content_source(
+    db_path: Path, source_path: str, file_hash: str, chunk_count: int
+) -> None:
+    """Insert or update a content_sources row."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        conn.execute(
+            """INSERT INTO content_sources (source_path, file_hash, indexed_at, chunk_count)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(source_path) DO UPDATE SET
+                   file_hash = excluded.file_hash,
+                   indexed_at = excluded.indexed_at,
+                   chunk_count = excluded.chunk_count""",
+            (source_path, file_hash, now, chunk_count),
+        )
+
+
+def get_latest_shown_image(db_path: Path) -> ImageRecord | None:
+    """Return the most recently shown image, or None."""
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT i.* FROM wallpaper_history h "
+            "JOIN images i ON i.id = h.image_id "
+            "ORDER BY h.shown_at DESC LIMIT 1"
+        ).fetchone()
+    return _row_to_record(row) if row else None
+
+
+def get_content_stats(db_path: Path) -> dict[str, Any]:
+    """Return summary statistics from the content_sources table."""
+    with _connect(db_path) as conn:
+        try:
+            rows = conn.execute(
+                "SELECT source_path, file_hash, indexed_at, chunk_count "
+                "FROM content_sources ORDER BY indexed_at DESC"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Table may not exist yet (DB predates this feature)
+            return {"total_sources": 0, "total_chunks": 0, "sources": []}
+
+    sources = [
+        {
+            "source_path": r["source_path"],
+            "chunk_count": r["chunk_count"],
+            "indexed_at": r["indexed_at"],
+        }
+        for r in rows
+    ]
+    return {
+        "total_sources": len(sources),
+        "total_chunks": sum(s["chunk_count"] for s in sources),
+        "sources": sources,
+    }
 
 
 def get_stats(db_path: Path) -> dict[str, Any]:
