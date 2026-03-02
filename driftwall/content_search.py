@@ -9,18 +9,16 @@ from .db import ImageRecord
 
 
 def build_image_query(image: ImageRecord) -> str:
-    """Build a rich query string from ImageRecord fields for semantic search."""
+    """Build a query string from ImageRecord fields for semantic search."""
+    if image.one_paragraph:
+        return image.one_paragraph
     parts = []
     for value in (
-        image.one_paragraph,
         image.one_sentence,
         image.keywords,
         image.mood,
         image.primary_subject,
         image.setting,
-        image.season,
-        image.time_of_day,
-        image.dominant_colors,
     ):
         if value:
             parts.append(value.replace("|", " "))

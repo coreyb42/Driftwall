@@ -7,7 +7,8 @@ from driftwall.db import ImageRecord
 
 
 class TestBuildImageQueryFull(unittest.TestCase):
-    def test_all_fields_present_in_query(self):
+    def test_one_paragraph_used_directly(self):
+        """When one_paragraph is set it is returned as-is; other fields are not appended."""
         image = ImageRecord(
             one_paragraph="A stormy seascape at dusk",
             one_sentence="Dramatic waves crash on rocky shores",
@@ -15,19 +16,24 @@ class TestBuildImageQueryFull(unittest.TestCase):
             mood="melancholic|tense",
             primary_subject="ocean",
             setting="coastal",
-            season="autumn",
-            time_of_day="dusk",
-            dominant_colors="grey|blue|white",
         )
         query = build_image_query(image)
-        self.assertIn("stormy seascape at dusk", query)
+        self.assertEqual(query, "A stormy seascape at dusk")
+
+    def test_fallback_fields_used_when_no_paragraph(self):
+        """When one_paragraph is absent, remaining fields are assembled into the query."""
+        image = ImageRecord(
+            one_sentence="Dramatic waves crash on rocky shores",
+            keywords="ocean|storm|waves|drama",
+            mood="melancholic|tense",
+            primary_subject="ocean",
+            setting="coastal",
+        )
+        query = build_image_query(image)
         self.assertIn("Dramatic waves", query)
         self.assertIn("ocean storm waves drama", query)
         self.assertIn("melancholic tense", query)
         self.assertIn("coastal", query)
-        self.assertIn("autumn", query)
-        self.assertIn("dusk", query)
-        self.assertIn("grey blue white", query)
 
     def test_pipe_delimiters_replaced_with_spaces(self):
         image = ImageRecord(keywords="fog|mist|morning")
