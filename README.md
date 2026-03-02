@@ -32,8 +32,9 @@ You point Driftwall at a folder of text — Project Gutenberg books, your own wr
 Those passages then float over the wallpaper as small, dark-scrimmed text overlays that fade in and out on a timer. A mountain landscape might surface Muir quotes or Thoreau paragraphs. A storm at sea might pull up Conrad or Melville. A snowy city street might bring up Chekhov. None of this is hardcoded — it emerges from the semantic similarity between what's in the image and what's in your text library.
 
 **Content format:**
-- `.txt` / `.md` — prose is chunked at paragraph/sentence boundaries (300–600 chars); poetry short-line blocks are kept intact
+- `.txt` / `.md` / `.rst` — prose is chunked at paragraph/sentence boundaries (300–600 chars); poetry short-line blocks and chapter headers are handled automatically
 - `.csv` — one quote per row, with optional `author`, `date`, and `source` columns; attribution lines are rendered automatically below each quote
+- `.epub` / `.pdf` / `.html` / `.docx` / `.mobi` — full ebook and document ingestion; requires optional dependencies (`pip install -e ".[ebooks]"` or install individually — see below)
 
 ### LLM-named text overlays (static)
 
@@ -221,7 +222,7 @@ driftwall ui
    ollama pull nomic-embed-text
    ```
 
-2. **Create your content library.** Drop `.txt`, `.md`, or `.csv` files into `~/Documents/driftwall-content/` (or whatever `content_dir` you set). For quotes, use CSV with columns `text`, `author` (optional), `source` (optional), `date` (optional):
+2. **Create your content library.** Drop any supported files into `~/Documents/driftwall-content/` (or whatever `content_dir` you set). Supported formats: `.txt`, `.md`, `.rst`, `.csv`, `.epub`, `.pdf`, `.html`, `.docx`, `.mobi`. For quotes, use CSV with columns `text`, `author` (optional), `source` (optional), `date` (optional):
    ```csv
    text,author,source
    "In every walk with nature, one receives far more than he seeks.",John Muir,Our National Parks
@@ -372,7 +373,7 @@ driftwall/
 │   ├── selector.py         # Query builder, weighted random selection
 │   ├── overlay.py          # Static LLM text overlay generation and compositing
 │   ├── content_store.py    # ContentChunk dataclass; ChromaDB CRUD helpers
-│   ├── content_scanner.py  # Ingest .txt/.md/.csv → chunk → embed → ChromaDB
+│   ├── content_scanner.py  # Ingest text/ebook files → chunk → embed → ChromaDB
 │   ├── content_search.py   # Build image query, search ChromaDB, return chunks
 │   ├── dynamic_overlay.py  # FloatingOverlay (GTK3) + DynamicOverlayManager
 │   ├── downloader.py       # Met Museum Open Access API downloader
@@ -408,5 +409,15 @@ driftwall/
 | `chromadb` | Vector store for semantic content search (optional; `pip install chromadb`) |
 | `python3-gi` | PyGObject / GTK3 — system package, not installed by pip |
 | `gir1.2-ayatanaappindicator3-0.1` | AppIndicator3 — system package |
+
+**Optional ebook/document dependencies** (`pip install -e ".[ebooks]"` or individually):
+
+| Package | Format |
+|---|---|
+| `ebooklib` + `beautifulsoup4` | `.epub` |
+| `pypdf` | `.pdf` |
+| `beautifulsoup4` | `.html` / `.htm` |
+| `python-docx` | `.docx` |
+| `mobi` | `.mobi` |
 
 All other dependencies (`sqlite3`, `argparse`, `hashlib`, `pathlib`, `urllib`) are stdlib.
