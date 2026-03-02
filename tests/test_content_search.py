@@ -1,8 +1,13 @@
 """Unit tests for driftwall.content_search — query building."""
 
+import sys
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
-from driftwall.content_search import build_image_query
+from driftwall.content_search import build_image_query, get_content_for_image, search_content
+from driftwall.config import Config
 from driftwall.db import ImageRecord
 
 
@@ -61,6 +66,92 @@ class TestBuildImageQuerySparse(unittest.TestCase):
         image = ImageRecord(one_sentence="Beautiful sunrise", season=None)
         query = build_image_query(image)
         self.assertNotIn("None", query)
+
+
+class TestSearchContent(unittest.TestCase):
+    def test_search_content_applies_in_where_filter_for_multiple_sources(self):
+        fake_collection = MagicMock()
+        fake_collection.query.return_value = {
+            "ids": [["a::0"]],
+            "documents": [["hello"]],
+            "metadatas": [[{"source_path": "a", "source_type": "text", "chunk_index": 0}]],
+        }
+
+        class _FakeOllamaClient:
+            def __init__(self, host: str) -> None:
+                self.host = host
+
+            def embed(self, model: str, input: list[str]):
+                return SimpleNamespace(embeddings=[[0.1, 0.2, 0.3]])
+
+        fake_ollama = SimpleNamespace(Client=_FakeOllamaClient)
+        with patch.dict(sys.modules, {"ollama": fake_ollama}):
+            search_content(
+                query_text="stormy sea",
+                collection=fake_collection,
+                embed_model="nomic-embed-text",
+                host="http://localhost:11434",
+                source_paths=["a", "b", "c"],
+            )
+
+        kwargs = fake_collection.query.call_args.kwargs
+        self.assertEqual(kwargs["where"], {"source_path": {"$in": ["a", "b", "c"]}})
+
+    def test_search_content_applies_equals_filter_for_single_source(self):
+        fake_collection = MagicMock()
+        fake_collection.query.return_value = {
+            "ids": [["a::0"]],
+            "documents": [["hello"]],
+            "metadatas": [[{"source_path": "a", "source_type": "text", "chunk_index": 0}]],
+        }
+
+        class _FakeOllamaClient:
+            def __init__(self, host: str) -> None:
+                self.host = host
+
+            def embed(self, model: str, input: list[str]):
+                return SimpleNamespace(embeddings=[[0.1, 0.2, 0.3]])
+
+        fake_ollama = SimpleNamespace(Client=_FakeOllamaClient)
+        with patch.dict(sys.modules, {"ollama": fake_ollama}):
+            search_content(
+                query_text="stormy sea",
+                collection=fake_collection,
+                embed_model="nomic-embed-text",
+                host="http://localhost:11434",
+                source_paths=["a"],
+            )
+
+        kwargs = fake_collection.query.call_args.kwargs
+        self.assertEqual(kwargs["where"], {"source_path": "a"})
+
+
+class TestGetContentForImage(unittest.TestCase):
+    def test_uses_random_subset_of_sources_when_configured(self):
+        config = Config()
+        config.dynamic_overlay.random_source_subset_size = 3
+        image = ImageRecord(one_sentence="A snowy mountain")
+
+        with patch("driftwall.content_search.get_chroma_client", return_value=object()), patch(
+            "driftwall.content_search.get_collection", return_value=object()
+        ), patch(
+            "driftwall.content_search.list_content_source_paths",
+            return_value=["s1", "s2", "s3", "s4", "s5"],
+        ), patch(
+            "driftwall.content_search.random.sample",
+            return_value=["s2", "s4", "s5"],
+        ), patch(
+            "driftwall.content_search.search_content",
+            return_value=[],
+        ) as mock_search:
+            get_content_for_image(
+                image=image,
+                chroma_path=Path("/tmp/chroma"),
+                config=config,
+                n_results=7,
+            )
+
+        self.assertEqual(mock_search.call_args.kwargs["source_paths"], ["s2", "s4", "s5"])
 
 
 if __name__ == "__main__":

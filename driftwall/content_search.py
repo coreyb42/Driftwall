@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import random
 from pathlib import Path
 
 from .content_store import ContentChunk, get_chroma_client, get_collection
-from .db import ImageRecord
+from .db import ImageRecord, list_content_source_paths
 
 
 def build_image_query(image: ImageRecord) -> str:
@@ -31,6 +32,7 @@ def search_content(
     embed_model: str,
     host: str,
     n_results: int = 10,
+    source_paths: list[str] | None = None,
 ) -> list[ContentChunk]:
     """Embed query_text and return the top-n matching ContentChunks."""
     import ollama  # type: ignore[import]
@@ -39,12 +41,24 @@ def search_content(
     resp = client.embed(model=embed_model, input=[query_text])
     query_embedding = resp.embeddings[0]
 
+    where_filter = None
+    if source_paths:
+        unique_paths = [p for p in dict.fromkeys(source_paths) if p]
+        if len(unique_paths) == 1:
+            where_filter = {"source_path": unique_paths[0]}
+        elif unique_paths:
+            where_filter = {"source_path": {"$in": unique_paths}}
+
+    query_kwargs = {
+        "query_embeddings": [query_embedding],
+        "n_results": n_results,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if where_filter is not None:
+        query_kwargs["where"] = where_filter
+
     try:
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=n_results,
-            include=["documents", "metadatas", "distances"],
-        )
+        results = collection.query(**query_kwargs)
     except Exception:
         return []
 
@@ -85,12 +99,23 @@ def get_content_for_image(
     try:
         client = get_chroma_client(chroma_path)
         collection = get_collection(client)
+        subset_size = max(0, int(getattr(config.dynamic_overlay, "random_source_subset_size", 0)))
+        source_subset: list[str] | None = None
+        if subset_size > 0:
+            source_paths = list_content_source_paths(config.resolved_db_path)
+            if source_paths:
+                source_subset = (
+                    random.sample(source_paths, subset_size)
+                    if len(source_paths) > subset_size
+                    else source_paths
+                )
         return search_content(
             query_text=query,
             collection=collection,
             embed_model=config.content.embed_model,
             host=config.ollama.host,
             n_results=n_results,
+            source_paths=source_subset,
         )
     except Exception as e:
         import logging

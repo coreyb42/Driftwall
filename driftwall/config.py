@@ -87,6 +87,7 @@ class DynamicOverlayConfig:
     min_lifetime_seconds: int = 30
     max_lifetime_seconds: int = 90
     spawn_interval_seconds: int = 20
+    random_source_subset_size: int = 0  # 0 = disabled; otherwise sample N sources/query
     font_size: int = 18          # px
     max_screen_fraction: float = 0.10
     font_file: str = ""          # empty = auto-detect
@@ -227,6 +228,7 @@ def load_config(path: Path | None = None) -> Config:
         min_lifetime_seconds=dyn_raw.get("min_lifetime_seconds", 30),
         max_lifetime_seconds=dyn_raw.get("max_lifetime_seconds", 90),
         spawn_interval_seconds=dyn_raw.get("spawn_interval_seconds", 20),
+        random_source_subset_size=int(dyn_raw.get("random_source_subset_size", 0)),
         font_size=dyn_raw.get("font_size", 18),
         max_screen_fraction=float(dyn_raw.get("max_screen_fraction", 0.10)),
         font_file=dyn_raw.get("font_file", ""),

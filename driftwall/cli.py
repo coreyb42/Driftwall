@@ -337,6 +337,7 @@ def cmd_config(args: argparse.Namespace) -> int:
     print(f"  min_lifetime:        {config.dynamic_overlay.min_lifetime_seconds}s")
     print(f"  max_lifetime:        {config.dynamic_overlay.max_lifetime_seconds}s")
     print(f"  spawn_interval:      {config.dynamic_overlay.spawn_interval_seconds}s")
+    print(f"  random_source_subset_size: {config.dynamic_overlay.random_source_subset_size}")
     print(f"  font_size:           {config.dynamic_overlay.font_size}px")
     print(f"  max_screen_fraction: {config.dynamic_overlay.max_screen_fraction}")
     print(f"  font_file:           {config.dynamic_overlay.font_file or '(auto)'}")

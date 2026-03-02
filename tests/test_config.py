@@ -67,6 +67,25 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.triggers.time_of_day_map[0].values, ["morning"])
         self.assertEqual(cfg.download.output_dir, Path.home() / "tmp-driftwall-tests")
 
+    def test_load_config_parses_dynamic_overlay_random_source_subset_size(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as td:
+            config_path = Path(td) / "config.toml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "[dynamic_overlay]",
+                        "random_source_subset_size = 3",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            cfg = load_config(config_path)
+
+        self.assertEqual(cfg.dynamic_overlay.random_source_subset_size, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -149,6 +149,7 @@ embed_model = "nomic-embed-text"         # Ollama embedding model
 enabled               = false            # show floating content overlays while wallpaper is displayed
 max_simultaneous      = 3               # overlays visible at once
 spawn_interval_seconds = 20             # seconds between spawning a new overlay
+random_source_subset_size = 0           # 0 disables; otherwise query against a random subset of N sources
 min_lifetime_seconds  = 30              # minimum time an overlay stays visible
 max_lifetime_seconds  = 90             # maximum time an overlay stays visible
 font_size             = 18              # text size in pixels

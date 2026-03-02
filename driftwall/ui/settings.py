@@ -405,6 +405,16 @@ class SettingsDialog(Gtk.Dialog):
         self._dyn_spawn_interval = _spin(dyn.get("spawn_interval_seconds", 20), 5, 600)
         box.pack_start(_row("Spawn interval (s)", self._dyn_spawn_interval), False, False, 0)
 
+        self._dyn_random_source_subset_size = _spin(
+            dyn.get("random_source_subset_size", 0), 0, 1000
+        )
+        box.pack_start(
+            _row("Random source subset size", self._dyn_random_source_subset_size),
+            False,
+            False,
+            0,
+        )
+
         self._dyn_min_lifetime = _spin(dyn.get("min_lifetime_seconds", 30), 5, 300)
         box.pack_start(_row("Min lifetime (s)", self._dyn_min_lifetime), False, False, 0)
 
@@ -561,6 +571,7 @@ class SettingsDialog(Gtk.Dialog):
             "enabled": self._dyn_enabled.get_active(),
             "max_simultaneous": int(self._dyn_max_simultaneous.get_value()),
             "spawn_interval_seconds": int(self._dyn_spawn_interval.get_value()),
+            "random_source_subset_size": int(self._dyn_random_source_subset_size.get_value()),
             "min_lifetime_seconds": int(self._dyn_min_lifetime.get_value()),
             "max_lifetime_seconds": int(self._dyn_max_lifetime.get_value()),
             "font_size": int(self._dyn_font_size.get_value()),

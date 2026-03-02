@@ -331,6 +331,19 @@ def get_content_source(db_path: Path, source_path: str) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def list_content_source_paths(db_path: Path) -> list[str]:
+    """Return all indexed content source paths from content_sources."""
+    with _connect(db_path) as conn:
+        try:
+            rows = conn.execute(
+                "SELECT source_path FROM content_sources ORDER BY source_path"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Table may not exist yet (DB predates this feature)
+            return []
+    return [r["source_path"] for r in rows]
+
+
 def upsert_content_source(
     db_path: Path, source_path: str, file_hash: str, chunk_count: int
 ) -> None:
