@@ -31,24 +31,30 @@ def get_collection(client):  # type: ignore[return]
     )
 
 
+_CHROMA_MAX_BATCH = 5000  # ChromaDB hard limit is ~5461; stay safely below it
+
+
 def add_chunks(collection, chunks: list[ContentChunk], embeddings: list[list[float]]) -> None:
     """Upsert chunks with pre-computed embeddings into the collection."""
     if not chunks:
         return
-    collection.upsert(
-        ids=[c.id for c in chunks],
-        documents=[c.text for c in chunks],
-        embeddings=embeddings,
-        metadatas=[
-            {
-                "source_path": c.source_path,
-                "source_type": c.source_type,
-                "chunk_index": c.chunk_index,
-                **{k: str(v) for k, v in c.metadata.items() if v is not None},
-            }
-            for c in chunks
-        ],
-    )
+    for start in range(0, len(chunks), _CHROMA_MAX_BATCH):
+        batch_chunks = chunks[start : start + _CHROMA_MAX_BATCH]
+        batch_embeddings = embeddings[start : start + _CHROMA_MAX_BATCH]
+        collection.upsert(
+            ids=[c.id for c in batch_chunks],
+            documents=[c.text for c in batch_chunks],
+            embeddings=batch_embeddings,
+            metadatas=[
+                {
+                    "source_path": c.source_path,
+                    "source_type": c.source_type,
+                    "chunk_index": c.chunk_index,
+                    **{k: str(v) for k, v in c.metadata.items() if v is not None},
+                }
+                for c in batch_chunks
+            ],
+        )
 
 
 def delete_by_source(collection, source_path: str) -> None:
