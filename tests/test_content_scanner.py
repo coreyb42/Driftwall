@@ -1,12 +1,25 @@
-"""Unit tests for driftwall.content_scanner — chunking and CSV parsing."""
+"""Unit tests for driftwall.content_scanner — chunking, CSV parsing, and binary extractors."""
 
 import csv
 import io
+import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
-from driftwall.content_scanner import chunk_text, parse_csv_quotes
+from driftwall.content_scanner import (
+    chunk_text,
+    parse_csv_quotes,
+    SUPPORTED_SUFFIXES,
+    _extract_epub,
+    _extract_pdf,
+    _extract_html,
+    _extract_docx,
+    _extract_mobi,
+    _read_text,
+    _EXTRACTORS,
+)
 from driftwall.content_store import ContentChunk
 
 
@@ -144,6 +157,105 @@ class TestParseCsvQuotes(unittest.TestCase):
         chunks = parse_csv_quotes(path)
         self.assertTrue(chunks[0].id.startswith(str(path)))
         path.unlink()
+
+
+class TestSupportedSuffixes(unittest.TestCase):
+    def test_plain_text_always_present(self):
+        for ext in (".txt", ".md", ".rst", ".csv"):
+            self.assertIn(ext, SUPPORTED_SUFFIXES)
+
+    def test_ebook_formats_present(self):
+        for ext in (".epub", ".pdf", ".html", ".htm", ".docx", ".mobi"):
+            self.assertIn(ext, SUPPORTED_SUFFIXES)
+
+    def test_read_text_used_for_plain(self):
+        for ext in (".txt", ".md", ".rst"):
+            self.assertIs(_EXTRACTORS[ext], _read_text)
+
+
+class TestExtractorImportErrors(unittest.TestCase):
+    """Each binary extractor must raise ImportError when its library is absent."""
+
+    def _missing(self, *module_names: str):
+        """Context manager that hides the given modules from the import system."""
+        return unittest.mock.patch.dict(sys.modules, {m: None for m in module_names})
+
+    def test_epub_raises_import_error(self):
+        with self._missing("ebooklib", "ebooklib.epub"):
+            with self.assertRaises(ImportError):
+                _extract_epub(Path("dummy.epub"))
+
+    def test_pdf_raises_import_error(self):
+        with self._missing("pypdf"):
+            with self.assertRaises(ImportError):
+                _extract_pdf(Path("dummy.pdf"))
+
+    def test_html_raises_import_error(self):
+        with self._missing("bs4"):
+            with self.assertRaises(ImportError):
+                _extract_html(Path("dummy.html"))
+
+    def test_docx_raises_import_error(self):
+        with self._missing("docx"):
+            with self.assertRaises(ImportError):
+                _extract_docx(Path("dummy.docx"))
+
+    def test_mobi_raises_import_error(self):
+        with self._missing("mobi"):
+            with self.assertRaises(ImportError):
+                _extract_mobi(Path("dummy.mobi"))
+
+
+_HAS_BS4 = True
+try:
+    import bs4  # noqa: F401
+except ImportError:
+    _HAS_BS4 = False
+
+
+@unittest.skipUnless(_HAS_BS4, "beautifulsoup4 not installed")
+class TestExtractHtml(unittest.TestCase):
+    def _write(self, html: str) -> Path:
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".html", delete=False, encoding="utf-8"
+        )
+        tmp.write(html)
+        tmp.flush()
+        tmp.close()
+        return Path(tmp.name)
+
+    def test_basic_html_extraction(self):
+        path = self._write("<html><body><p>Hello world.</p></body></html>")
+        try:
+            text = _extract_html(path)
+            self.assertIn("Hello world", text)
+        finally:
+            path.unlink()
+
+    def test_script_and_style_stripped(self):
+        path = self._write(
+            "<html><head><style>body{color:red}</style></head>"
+            "<body><script>alert(1)</script><p>Keep this.</p></body></html>"
+        )
+        try:
+            text = _extract_html(path)
+            self.assertNotIn("body{color:red}", text)
+            self.assertNotIn("alert(1)", text)
+            self.assertIn("Keep this", text)
+        finally:
+            path.unlink()
+
+    def test_nav_and_footer_stripped(self):
+        path = self._write(
+            "<html><body><nav>Menu</nav><p>Content.</p><footer>Footer</footer></body></html>"
+        )
+        try:
+            text = _extract_html(path)
+            self.assertNotIn("Menu", text)
+            self.assertNotIn("Footer", text)
+            self.assertIn("Content", text)
+        finally:
+            path.unlink()
 
 
 if __name__ == "__main__":
