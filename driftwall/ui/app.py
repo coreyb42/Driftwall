@@ -275,5 +275,23 @@ class DriftwallApp:
     def _on_settings(self, _item: Gtk.MenuItem) -> None:
         from driftwall.ui.settings import SettingsDialog
         dialog = SettingsDialog(config_path=self.config_path)
-        dialog.run()
+        response = dialog.run()
         dialog.destroy()
+        if response == Gtk.ResponseType.OK:
+            self._restart_overlay_manager()
+
+    def _restart_overlay_manager(self) -> None:
+        """Stop the current overlay manager and start a fresh one with reloaded config."""
+        if self._overlay_manager is not None:
+            self._overlay_manager.stop()
+            self._overlay_manager = None
+        try:
+            from driftwall.config import load_config
+            config = load_config(Path(self.config_path) if self.config_path else None)
+            if config.dynamic_overlay.enabled and config.content.enabled:
+                from driftwall.dynamic_overlay import DynamicOverlayManager
+                self._overlay_manager = DynamicOverlayManager(config, config.resolved_db_path)
+                self._overlay_manager.start()
+                self._seed_overlay_manager_from_history(config)
+        except Exception as e:
+            log.warning("Dynamic overlay restart failed: %s", e)

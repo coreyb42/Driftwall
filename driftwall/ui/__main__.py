@@ -3,7 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    stream=sys.stdout,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+)
+# Silence noisy third-party HTTP debug logs
+for _noisy in ("httpcore", "httpx", "urllib3", "chromadb"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
 def main() -> None:
