@@ -6,6 +6,7 @@ import logging
 import random
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Callable
 
@@ -62,6 +63,7 @@ class FloatingOverlay(Gtk.Window):
         super().__init__()
         self._on_destroyed = on_destroyed
         self._fade_id: int | None = None
+        self._relower_id: int | None = None
         self._target_opacity = 1.0
 
         self.set_type_hint(Gdk.WindowTypeHint.NORMAL)
@@ -152,13 +154,23 @@ class FloatingOverlay(Gtk.Window):
 
     def fade_in(self) -> None:
         self.show_all()
-        # Lower to bottom of normal window stack so other app windows appear above.
-        # Must be called after show_all() so the GDK window is realized.
+        # Lower to bottom of normal window stack on initial show, then keep re-lowering
+        # so the overlay stays below any window raised after us. gdk_win.lower() is a
+        # one-shot XLowerWindow call; without the periodic re-lower, raising any other
+        # window leaves our overlay above it until the next explicit lower() call.
         gdk_win = self.get_window()
         if gdk_win:
             gdk_win.lower()
+        self._relower_id = GLib.timeout_add(1500, self._relower)
         self._target_opacity = 1.0
         self._fade_id = GLib.timeout_add(30, self._step_fade_in)
+
+    def _relower(self) -> bool:
+        gdk_win = self.get_window()
+        if gdk_win:
+            gdk_win.lower()
+            return True
+        return False
 
     def _step_fade_in(self) -> bool:
         current = self.get_opacity()
@@ -170,6 +182,9 @@ class FloatingOverlay(Gtk.Window):
         return True
 
     def fade_out(self) -> None:
+        if self._relower_id is not None:
+            GLib.source_remove(self._relower_id)
+            self._relower_id = None
         if self._fade_id is not None:
             GLib.source_remove(self._fade_id)
         self._fade_id = GLib.timeout_add(30, self._step_fade_out)
@@ -194,13 +209,20 @@ class FloatingOverlay(Gtk.Window):
 class DynamicOverlayManager:
     """Manages spawning, timing, and teardown of FloatingOverlay windows."""
 
+    # Number of top results to fetch from ChromaDB per spawn; randomise within this window
+    _FETCH_N = 50
+    # How many recently-shown chunk IDs to remember for deduplication
+    _RECENT_MAXLEN = 50
+
     def __init__(self, config, db_path: Path) -> None:
         self._config = config
         self._db_path = db_path
-        self._content_pool: list = []  # list[ContentChunk] — working queue
-        self._content_pool_full: list = []  # full set for recycling when queue empties
-        self._active: list[tuple[FloatingOverlay, float, int]] = []  # (overlay, expire_time, zone)
+        self._current_image = None  # ImageRecord of the current wallpaper
+        # (overlay, expire_time, zone, chunk_id)
+        self._active: list[tuple[FloatingOverlay, float, int, str]] = []
         self._occupied_zones: set[int] = set()
+        self._recently_shown: deque[str] = deque(maxlen=self._RECENT_MAXLEN)
+        self._fetch_in_progress = False
         self._spawn_timer_id: int | None = None
         self._expire_timer_id: int | None = None
         self._lock = threading.Lock()
@@ -240,49 +262,29 @@ class DynamicOverlayManager:
                 setattr(self, attr, None)
         with self._lock:
             active = list(self._active)
-        for overlay, _exp, _zone in active:
+        for overlay, _exp, _zone, _cid in active:
             GLib.idle_add(overlay.fade_out)
 
     def set_image(self, image) -> None:
-        """Trigger background content fetch for a new image."""
-        from .content_search import get_content_for_image
-
-        def _fetch() -> None:
-            try:
-                chunks = get_content_for_image(
-                    image,
-                    self._config.resolved_chroma_path,
-                    self._config,
-                    n_results=20,
-                )
-            except Exception as e:
-                log.warning("Content fetch failed: %s", e)
-                chunks = []
-            GLib.idle_add(self._on_new_content, chunks)
-
-        threading.Thread(target=_fetch, daemon=True).start()
-
-    def _on_new_content(self, chunks: list) -> bool:
-        random.shuffle(chunks)
+        """Record the current wallpaper image and fade out existing overlays."""
         with self._lock:
-            self._content_pool = list(chunks)
-            self._content_pool_full = list(chunks)  # keep full copy for recycling
+            self._current_image = image
             active = list(self._active)
-        for overlay, _exp, _zone in active:
-            overlay.fade_out()
-        return False
+        log.debug("set_image: %s", getattr(image, "path", image))
+        for overlay, _exp, _zone, _cid in active:
+            GLib.idle_add(overlay.fade_out)
 
     def _expire_check(self) -> bool:
         """Fade out overlays that have exceeded their lifetime. Runs every 5 seconds."""
         now = time.monotonic()
         with self._lock:
             still_active = []
-            for overlay, exp, zone in self._active:
+            for overlay, exp, zone, cid in self._active:
                 if now >= exp:
                     GLib.idle_add(overlay.fade_out)
                     self._occupied_zones.discard(zone)
                 else:
-                    still_active.append((overlay, exp, zone))
+                    still_active.append((overlay, exp, zone, cid))
             self._active = still_active
         return True
 
@@ -291,32 +293,100 @@ class DynamicOverlayManager:
         cfg = self._config.dynamic_overlay
         with self._lock:
             n_active = len(self._active)
-            pool_empty = not self._content_pool
+            no_image = self._current_image is None
+            fetch_busy = self._fetch_in_progress
 
-        if n_active < cfg.max_simultaneous and not pool_empty:
+        log.debug("_tick: active=%d max=%d no_image=%s fetch_busy=%s",
+                  n_active, cfg.max_simultaneous, no_image, fetch_busy)
+
+        if n_active < cfg.max_simultaneous and not no_image and not fetch_busy:
             GLib.idle_add(self._spawn_one)
 
         return True  # keep repeating
 
     def _spawn_one(self) -> bool:
+        """Kick off a background ChromaDB query then spawn an overlay on return."""
         cfg = self._config.dynamic_overlay
         with self._lock:
-            # Re-check limit here — multiple spawn calls may be queued via idle_add
+            # Re-check — multiple spawn calls may have been queued via idle_add
             if len(self._active) >= cfg.max_simultaneous:
                 return False
-            if not self._content_pool:
-                # Recycle: reshuffle the full set so overlays keep cycling
-                if not self._content_pool_full:
-                    return False
-                self._content_pool = list(self._content_pool_full)
-                random.shuffle(self._content_pool)
-            excluded = self._occupied_zones | self._static_overlay_zones
-            free_zones = [z for z in _ELIGIBLE_ZONES if z not in excluded]
-            if not free_zones:
+            if self._current_image is None:
                 return False
-            chunk = self._content_pool.pop(0)
+            if self._fetch_in_progress:
+                return False
+            self._fetch_in_progress = True
+            image = self._current_image
+
+        log.debug("_spawn_one: fetching content for image %s", getattr(image, "path", image))
+
+        def _fetch() -> None:
+            from .content_search import get_content_for_image
+            try:
+                chunks = get_content_for_image(
+                    image,
+                    self._config.resolved_chroma_path,
+                    self._config,
+                    n_results=self._FETCH_N,
+                )
+                log.debug("_fetch: got %d chunks from ChromaDB", len(chunks))
+            except Exception as e:
+                log.warning("Content fetch failed: %s", e)
+                chunks = []
+            GLib.idle_add(self._do_spawn, chunks)
+
+        threading.Thread(target=_fetch, daemon=True).start()
+        return False
+
+    def _do_spawn(self, chunks: list) -> bool:
+        """Called on the GLib main thread with fresh ChromaDB results."""
+        cfg = self._config.dynamic_overlay
+        with self._lock:
+            self._fetch_in_progress = False
+
+            if len(self._active) >= cfg.max_simultaneous:
+                return False
+            if not chunks:
+                log.debug("_do_spawn: no chunks returned")
+                return False
+
+            # IDs to exclude: currently displayed + recently shown
+            active_ids = {cid for _, _, _, cid in self._active}
+            recently = set(self._recently_shown)
+            candidates = [c for c in chunks if c.id not in active_ids and c.id not in recently]
+            if not candidates:
+                # Library is small — fall back to excluding only the active ones
+                log.debug("_do_spawn: all candidates recently shown, relaxing dedup")
+                candidates = [c for c in chunks if c.id not in active_ids]
+            if not candidates:
+                log.debug("_do_spawn: no candidates after filtering")
+                return False
+
+            # Source-diversity selection: group candidates by source file, pick a
+            # random source (each source gets equal weight regardless of chunk count),
+            # then pick the best-ranked chunk from that source. This prevents any
+            # single book from dominating even when it has strong semantic similarity
+            # to the current image. Falls back to pure random if grouping fails.
+            by_source: dict[str, list] = {}
+            for c in candidates:
+                by_source.setdefault(c.source_path, []).append(c)
+            chosen_source = random.choice(list(by_source.keys()))
+            source_pool = by_source[chosen_source][:5]  # top-5 from chosen source
+            chunk = random.choice(source_pool)
+            log.debug("_do_spawn: chose source '%s' (%d sources available)",
+                      chosen_source.split("/")[-1], len(by_source))
+
+            excluded_zones = self._occupied_zones | self._static_overlay_zones
+            free_zones = [z for z in _ELIGIBLE_ZONES if z not in excluded_zones]
+            if not free_zones:
+                log.debug("_do_spawn: no free zones")
+                return False
+
             zone = random.choice(free_zones)
             self._occupied_zones.add(zone)
+            self._recently_shown.append(chunk.id)
+
+        log.debug("_do_spawn: spawning '%s…' in zone %d", chunk.text[:40], zone)
 
         zx, zy, zw, zh = _zone_rect(zone, self._screen_w, self._screen_h)
         # Shift zone coordinates into the work area (accounts for top/side panels)
@@ -333,10 +403,12 @@ class DynamicOverlayManager:
 
         attribution = _format_attribution(chunk)
 
-        def _on_destroyed():
+        chunk_id = chunk.id
+
+        def _on_destroyed() -> None:
             with self._lock:
                 self._occupied_zones.discard(zone)
-                self._active = [(o, e, z) for o, e, z in self._active if z != zone]
+                self._active = [(o, e, z, c) for o, e, z, c in self._active if z != zone]
 
         overlay = FloatingOverlay(
             text=chunk.text,
@@ -354,7 +426,7 @@ class DynamicOverlayManager:
         expire_time = time.monotonic() + lifetime
 
         with self._lock:
-            self._active.append((overlay, expire_time, zone))
+            self._active.append((overlay, expire_time, zone, chunk_id))
 
         overlay.fade_in()
         return False
