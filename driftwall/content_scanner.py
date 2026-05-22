@@ -26,6 +26,9 @@ log = logging.getLogger(__name__)
 
 _BATCH_SIZE = 32
 
+# Minimum characters a chunk must have to be included in output.
+_MIN_CHUNK_CHARS = 50
+
 
 @dataclass
 class ContentScanResult:
@@ -38,6 +41,35 @@ class ContentScanResult:
 
 # ── text chunking ─────────────────────────────────────────────────────────────
 
+# Project Gutenberg start/end markers
+_PG_START = re.compile(
+    r"\*{3}\s*START OF (?:THE |THIS )?PROJECT GUTENBERG[^\n]*\*{3}",
+    re.IGNORECASE,
+)
+_PG_END = re.compile(
+    r"\*{3}\s*END OF (?:THE |THIS )?PROJECT GUTENBERG[^\n]*\*{3}",
+    re.IGNORECASE,
+)
+
+# Table-of-contents entry pattern: "CHAPTER I.", "Book Third.", "ACT 2.", etc.
+_TOC_ENTRY_RE = re.compile(
+    r"^\s*(?:chapter|part|book|act|scene|volume|section)\s+"
+    r"(?:[ivxlcdmIVXLCDM]+|\d+)\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_gutenberg_boilerplate(text: str) -> str:
+    """Remove Project Gutenberg header/footer boilerplate."""
+    m = _PG_START.search(text)
+    if m:
+        text = text[m.end():]
+    m = _PG_END.search(text)
+    if m:
+        text = text[:m.start()]
+    return text
+
+
 def _looks_like_poetry(paragraph: str) -> bool:
     """Heuristic: short lines with consistent line breaks look like poetry."""
     lines = paragraph.splitlines()
@@ -45,6 +77,18 @@ def _looks_like_poetry(paragraph: str) -> bool:
         return False
     avg_len = sum(len(l) for l in lines) / len(lines)
     return avg_len < 60
+
+
+def _looks_like_list_block(paragraph: str) -> bool:
+    """True for multi-line blocks with very short lines (character rosters, indexes).
+
+    These are NOT poetry — they're structural lists that should be skipped.
+    """
+    lines = paragraph.splitlines()
+    if len(lines) <= 4:
+        return False
+    avg_len = sum(len(l) for l in lines) / len(lines)
+    return avg_len < 25
 
 
 def _is_chapter_header(paragraph: str) -> bool:
@@ -63,6 +107,19 @@ def _is_chapter_header(paragraph: str) -> bool:
     return upper_ratio >= 0.60
 
 
+def _is_section_title(text: str) -> bool:
+    """True for short single-line paragraphs that look like section/poem titles.
+
+    These lack terminal sentence punctuation and are short enough to be labels.
+    """
+    if "\n" in text:
+        return False
+    t = text.strip()
+    if not t or len(t) > 80:
+        return False
+    return t[-1] not in ".?!:"
+
+
 def chunk_text(text: str, source_path: str) -> list:
     """Split text into coherent prose chunks of 300–600 characters.
 
@@ -72,6 +129,8 @@ def chunk_text(text: str, source_path: str) -> list:
 
     # Normalise line endings
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Strip Project Gutenberg header/footer
+    text = _strip_gutenberg_boilerplate(text)
     # Split on blank lines (paragraph breaks)
     paragraphs = re.split(r"\n{2,}", text)
 
@@ -83,16 +142,35 @@ def chunk_text(text: str, source_path: str) -> list:
         if not para:
             continue
 
-        # Skip chapter/part headers (single-line, mostly uppercase)
+        # Skip chapter/part headers (single-line, mostly uppercase).
+        # Also discard any accumulated section title from pending.
         if _is_chapter_header(para):
+            if pending and _is_section_title(pending):
+                pending = ""
             continue
 
-        # Poetry: keep short-line blocks as-is regardless of length
+        # Skip table-of-contents blocks: single or multi-line paragraphs where
+        # every line matches the TOC pattern (CHAPTER I., ACT 2., BOOK THIRD., etc.)
+        _para_lines = [l.strip() for l in para.splitlines() if l.strip()]
+        if _para_lines and all(_TOC_ENTRY_RE.match(l) for l in _para_lines):
+            continue
+
+        # Skip list blocks (character rosters, indexes) — multi-line, very short lines.
+        if _looks_like_list_block(para):
+            continue
+
+        # Poetry: keep short-line blocks verbatim.
+        # If pending is a section title (poem name), attach it to the poem.
         if _looks_like_poetry(para):
             if pending:
-                chunks.append(pending)
+                if _is_section_title(pending):
+                    chunks.append(pending + "\n\n" + para)
+                else:
+                    chunks.append(pending)
+                    chunks.append(para)
                 pending = ""
-            chunks.append(para)
+            else:
+                chunks.append(para)
             continue
 
         # Normalize hard line-wrapping (single newlines) to spaces.
@@ -144,18 +222,23 @@ def chunk_text(text: str, source_path: str) -> list:
     if pending:
         chunks.append(pending)
 
-    return [
-        ContentChunk(
-            id=f"{source_path}::{i}",
-            text=chunk,
-            source_path=source_path,
-            source_type="text",
-            chunk_index=i,
-            metadata={"source_title": Path(source_path).stem},
-        )
-        for i, chunk in enumerate(chunks)
-        if chunk.strip()
-    ]
+    # Filter out chunks that are too short to be meaningful overlays.
+    result = []
+    idx = 0
+    for chunk in chunks:
+        if chunk.strip() and len(chunk.strip()) >= _MIN_CHUNK_CHARS:
+            result.append(
+                ContentChunk(
+                    id=f"{source_path}::{idx}",
+                    text=chunk,
+                    source_path=source_path,
+                    source_type="text",
+                    chunk_index=idx,
+                    metadata={"source_title": Path(source_path).stem},
+                )
+            )
+            idx += 1
+    return result
 
 
 def parse_csv_quotes(csv_path: Path) -> list:
@@ -203,6 +286,26 @@ def hash_file(path: Path) -> str:
 
 # ── binary / rich-format extractors ──────────────────────────────────────────
 
+def _soup_to_text(soup) -> str:
+    """Extract text from a BeautifulSoup tree with proper paragraph breaks.
+
+    Appends \\n\\n after each block-level element so that chunk_text() can split
+    on paragraph boundaries.  Without this, get_text() produces a wall of
+    single-newline-separated lines and the entire document becomes one paragraph.
+    """
+    for tag in soup.find_all(
+        ["p", "div", "h1", "h2", "h3", "h4", "h5", "h6",
+         "li", "blockquote", "pre", "tr"]
+    ):
+        tag.append("\n\n")
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+    text = soup.get_text()
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def _extract_epub(path: Path) -> str:
     """Extract plain text from an EPUB. Requires ebooklib + beautifulsoup4."""
     try:
@@ -220,7 +323,7 @@ def _extract_epub(path: Path) -> str:
         soup = BeautifulSoup(item.get_content(), "html.parser")
         for tag in soup(["script", "style"]):
             tag.decompose()
-        text = soup.get_text(separator="\n", strip=True)
+        text = _soup_to_text(soup)
         if text:
             parts.append(text)
     return "\n\n".join(parts)
@@ -254,7 +357,7 @@ def _extract_html(path: Path) -> str:
     soup = BeautifulSoup(path.read_bytes(), "html.parser")
     for tag in soup(["script", "style", "nav", "header", "footer"]):
         tag.decompose()
-    return soup.get_text(separator="\n", strip=True)
+    return _soup_to_text(soup)
 
 
 def _extract_docx(path: Path) -> str:
@@ -288,7 +391,7 @@ def _extract_mobi(path: Path) -> str:
                 soup = BeautifulSoup(raw, "html.parser")
                 for tag in soup(["script", "style"]):
                     tag.decompose()
-                return soup.get_text(separator="\n", strip=True)
+                return _soup_to_text(soup)
             except ImportError:
                 pass  # fall through to raw decode
         return raw.decode("utf-8", errors="replace")

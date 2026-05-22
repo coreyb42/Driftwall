@@ -1,10 +1,10 @@
-"""Settings dialog — GTK3 Notebook with five tabs for all config sections."""
+"""Settings dialog — GTK3 Notebook for all config sections."""
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -22,6 +22,8 @@ try:
     import tomli_w
 except ImportError:
     tomli_w = None  # type: ignore[assignment]
+
+from driftwall.systemd_timer import sync_wallpaper_rotate_timer_interval
 
 
 def _row(label_text: str, widget: Gtk.Widget) -> Gtk.Box:
@@ -102,6 +104,80 @@ class _DirListWidget(Gtk.Box):
         return paths
 
 
+class _FontListWidget(Gtk.Box):
+    """A vertical list of specific font files with optional descriptions."""
+
+    def __init__(self, entries: list[dict[str, str]]) -> None:
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self._list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.pack_start(self._list_box, True, True, 0)
+
+        add_btn = Gtk.Button(label="+ Add font…")
+        add_btn.connect("clicked", self._on_add)
+        self.pack_start(add_btn, False, False, 0)
+
+        for entry in entries:
+            self._add_row(entry.get("path", ""), entry.get("description", ""))
+
+    def _add_row(self, path: str = "", description: str = "") -> None:
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+
+        path_entry = Gtk.Entry()
+        path_entry.set_text(path)
+        path_entry.set_hexpand(True)
+
+        pick_btn = Gtk.Button(label="…")
+        pick_btn.connect("clicked", self._on_pick, path_entry)
+
+        desc_entry = Gtk.Entry()
+        desc_entry.set_text(description)
+        desc_entry.set_placeholder_text("Optional reason/style for this font")
+        desc_entry.set_hexpand(True)
+
+        rm_btn = Gtk.Button(label="✕")
+        rm_btn.connect("clicked", self._on_remove, row)
+
+        row.pack_start(path_entry, True, True, 0)
+        row.pack_start(pick_btn, False, False, 0)
+        row.pack_start(desc_entry, True, True, 0)
+        row.pack_start(rm_btn, False, False, 0)
+        self._list_box.pack_start(row, False, False, 0)
+        row.show_all()
+
+    def _on_add(self, _btn: Gtk.Button) -> None:
+        self._add_row("", "")
+
+    def _on_pick(self, _btn: Gtk.Button, entry: Gtk.Entry) -> None:
+        dialog = Gtk.FileChooserDialog(
+            title="Select font file",
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_OPEN, Gtk.ResponseType.OK,
+        )
+        if dialog.run() == Gtk.ResponseType.OK:
+            entry.set_text(dialog.get_filename() or "")
+        dialog.destroy()
+
+    def _on_remove(self, _btn: Gtk.Button, row: Gtk.Box) -> None:
+        self._list_box.remove(row)
+
+    def get_entries(self) -> list[dict[str, str]]:
+        entries: list[dict[str, str]] = []
+        for row in self._list_box.get_children():
+            children = row.get_children()
+            if len(children) < 3:
+                continue
+            path_entry = children[0]
+            desc_entry = children[2]
+            path = path_entry.get_text().strip()
+            if not path:
+                continue
+            entries.append({"path": path, "description": desc_entry.get_text().strip()})
+        return entries
+
+
 def _spin(
     value: float,
     lo: float,
@@ -119,9 +195,14 @@ def _spin(
 
 
 class SettingsDialog(Gtk.Dialog):
-    def __init__(self, config_path: str | None = None) -> None:
+    def __init__(
+        self,
+        config_path: str | None = None,
+        on_saved: Callable[[], None] | None = None,
+    ) -> None:
         super().__init__(title="Driftwall Settings", modal=True)
         self.set_default_size(620, 520)
+        self._on_saved = on_saved
 
         self.config_path = Path(config_path) if config_path else (
             Path.home() / ".config" / "driftwall" / "config.toml"
@@ -139,12 +220,11 @@ class SettingsDialog(Gtk.Dialog):
         self._nb = notebook
 
         self._build_general_tab()
-        self._build_rotation_tab()
         self._build_ollama_tab()
         self._build_filters_tab()
         self._build_overlay_tab()
         self._build_content_tab()
-        self._build_download_tab()
+        self._build_fonts_tab()
 
         self.add_button("Cancel", Gtk.ResponseType.CANCEL)
         save_btn = self.add_button("Save", Gtk.ResponseType.OK)
@@ -199,9 +279,6 @@ class SettingsDialog(Gtk.Dialog):
         prompt_path = raw.get("prompt_path", str(DEFAULT_PROMPT_PATH))
         self._prompt_btn.set_filename(prompt_path)
         box.pack_start(_row("Classification prompt", self._prompt_btn), False, False, 0)
-
-    def _build_rotation_tab(self) -> None:
-        box = self._tab_box("Rotation")
         rot = self._raw.get("rotation", {})
 
         self._interval_spin = _spin(rot.get("interval_minutes", 30), 1, 1440)
@@ -209,6 +286,17 @@ class SettingsDialog(Gtk.Dialog):
 
         self._avoid_repeat_spin = _spin(rot.get("avoid_repeat_window", 50), 1, 500)
         box.pack_start(_row("Avoid repeat window", self._avoid_repeat_spin), False, False, 0)
+
+        dl = self._raw.get("download", {})
+        default_dir = str(Path.home() / "Pictures" / "driftwall-downloads")
+        self._download_output_dir = Gtk.FileChooserButton(
+            title="Select download directory",
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        current_dir = dl.get("output_dir", default_dir)
+        Path(current_dir).expanduser().mkdir(parents=True, exist_ok=True)
+        self._download_output_dir.set_filename(str(Path(current_dir).expanduser()))
+        box.pack_start(_row("Download directory", self._download_output_dir), False, False, 0)
 
     def _build_ollama_tab(self) -> None:
         box = self._tab_box("Ollama")
@@ -306,6 +394,9 @@ class SettingsDialog(Gtk.Dialog):
         self._overlay_model.set_placeholder_text("(same as ollama.model)")
         box.pack_start(_row("Model", self._overlay_model), False, False, 0)
 
+        self._overlay_font_size = _spin(ov.get("font_size", 0), 0, 144)
+        box.pack_start(_row("Font size (px, 0=auto)", self._overlay_font_size), False, False, 0)
+
         _quadrants = ["top-left", "top-right", "bottom-left", "bottom-right"]
         quadrant_raw = ov.get("quadrant", ["bottom-right"])
         active_quadrants: set[str] = set(
@@ -324,24 +415,6 @@ class SettingsDialog(Gtk.Dialog):
         quad_col.pack_start(quad_box, False, False, 0)
         quad_col.pack_start(quad_hint, False, False, 0)
         box.pack_start(_row("Quadrant", quad_col), False, False, 0)
-
-        self._overlay_font_file = Gtk.FileChooserButton(
-            title="Select specific font file",
-            action=Gtk.FileChooserAction.OPEN,
-        )
-        font_file = ov.get("font_file", "")
-        if font_file:
-            self._overlay_font_file.set_filename(font_file)
-        box.pack_start(_row("Font file (specific)", self._overlay_font_file), False, False, 0)
-
-        self._overlay_font_dir = Gtk.FileChooserButton(
-            title="Select font directory",
-            action=Gtk.FileChooserAction.SELECT_FOLDER,
-        )
-        font_dir = ov.get("font_dir", "")
-        if font_dir:
-            self._overlay_font_dir.set_filename(font_dir)
-        box.pack_start(_row("Font directory", self._overlay_font_dir), False, False, 0)
 
     def _build_content_tab(self) -> None:
         box = self._tab_box("Content")
@@ -429,36 +502,57 @@ class SettingsDialog(Gtk.Dialog):
         )
         box.pack_start(_row("Max screen fraction", self._dyn_max_fraction), False, False, 0)
 
-        self._dyn_font_file = Gtk.FileChooserButton(
-            title="Select font file for dynamic overlays",
-            action=Gtk.FileChooserAction.OPEN,
-        )
-        dyn_font = dyn.get("font_file", "")
-        if dyn_font:
-            self._dyn_font_file.set_filename(dyn_font)
-        box.pack_start(_row("Font file (optional)", self._dyn_font_file), False, False, 0)
+    def _build_fonts_tab(self) -> None:
+        box = self._tab_box("Fonts")
+        fonts = self._raw.get("fonts", {})
+        overlay_raw = self._raw.get("overlay", {})
+        dyn_raw = self._raw.get("dynamic_overlay", {})
 
-    def _build_download_tab(self) -> None:
-        box = self._tab_box("Download")
-        dl = self._raw.get("download", {})
+        source = str(fonts.get("source", "")).strip().lower()
+        entries = fonts.get("entries", [])
+        if not isinstance(entries, list):
+            entries = []
+        if not entries:
+            legacy_paths: list[str] = []
+            for p in (overlay_raw.get("font_file", ""), dyn_raw.get("font_file", "")):
+                if p and p not in legacy_paths:
+                    legacy_paths.append(p)
+            entries = [{"path": p, "description": ""} for p in legacy_paths]
 
-        default_dir = str(Path.home() / "Pictures" / "driftwall-downloads")
-        self._download_output_dir = Gtk.FileChooserButton(
-            title="Select download directory",
+        directory = str(fonts.get("directory", "")).strip() or str(overlay_raw.get("font_dir", "")).strip()
+        if source not in {"folder", "list"}:
+            source = "list" if entries else "folder"
+
+        self._fonts_source = Gtk.ComboBoxText()
+        self._fonts_source.append("folder", "Folder (scan recursively)")
+        self._fonts_source.append("list", "Specific font list")
+        self._fonts_source.set_active_id(source)
+        box.pack_start(_row("Font source", self._fonts_source), False, False, 0)
+
+        self._fonts_directory = Gtk.FileChooserButton(
+            title="Select font directory",
             action=Gtk.FileChooserAction.SELECT_FOLDER,
         )
-        current_dir = dl.get("output_dir", default_dir)
-        # FileChooserButton requires the directory to exist to set it
-        Path(current_dir).expanduser().mkdir(parents=True, exist_ok=True)
-        self._download_output_dir.set_filename(str(Path(current_dir).expanduser()))
-        box.pack_start(_row("Download directory", self._download_output_dir), False, False, 0)
+        if directory and Path(directory).expanduser().exists():
+            self._fonts_directory.set_filename(str(Path(directory).expanduser()))
+        box.pack_start(_row("Font folder", self._fonts_directory), False, False, 0)
+
+        self._fonts_entries = _FontListWidget(entries)
+        box.pack_start(_row("Font list", self._fonts_entries), True, True, 0)
 
         hint = Gtk.Label(xalign=0.0)
         hint.set_markup(
-            "<small>Images are saved into source-specific subfolders inside this directory.\n"
-            "e.g. <i>download_dir/met/dept-11/</i> or <i>download_dir/met/landscape/</i></small>"
+            "<small>For list mode, descriptions are optional. If omitted for a font, Driftwall uses the font name as fallback context.</small>"
         )
         box.pack_start(hint, False, False, 0)
+
+        def _sync_font_mode(*_args: object) -> None:
+            mode = self._fonts_source.get_active_id() or "folder"
+            self._fonts_directory.set_sensitive(mode == "folder")
+            self._fonts_entries.set_sensitive(mode == "list")
+
+        self._fonts_source.connect("changed", _sync_font_mode)
+        _sync_font_mode()
 
     # ── save ─────────────────────────────────────────────────────────────────
 
@@ -471,12 +565,17 @@ class SettingsDialog(Gtk.Dialog):
             )
             return
         try:
-            self._save()
-            self._show_info(f"Saved to {self.config_path}")
+            sync_msg = self._save()
+            if self._on_saved is not None:
+                self._on_saved()
+            msg = f"Saved to {self.config_path}"
+            if sync_msg:
+                msg = f"{msg}\n{sync_msg}"
+            self._show_info(msg)
         except Exception as e:
             self._show_info(f"Error saving: {e}", error=True)
 
-    def _save(self) -> None:
+    def _save(self) -> str | None:
         # Merge over existing raw to preserve unknown/future keys
         data: dict[str, Any] = dict(self._raw)
 
@@ -546,10 +645,11 @@ class SettingsDialog(Gtk.Dialog):
             "enabled": self._overlay_enabled.get_active(),
             "prompt": prompts,
             "model": self._overlay_model.get_text().strip(),
+            "font_size": int(self._overlay_font_size.get_value()),
             "quadrant": active_quads,
-            "font_file": self._overlay_font_file.get_filename() or "",
-            "font_dir": self._overlay_font_dir.get_filename() or "",
         }
+        data["overlay"].pop("font_file", None)
+        data["overlay"].pop("font_dir", None)
 
         # Content
         content_dir = self._content_dir.get_filename() or ""
@@ -576,7 +676,15 @@ class SettingsDialog(Gtk.Dialog):
             "max_lifetime_seconds": int(self._dyn_max_lifetime.get_value()),
             "font_size": int(self._dyn_font_size.get_value()),
             "max_screen_fraction": round(self._dyn_max_fraction.get_value(), 2),
-            "font_file": self._dyn_font_file.get_filename() or "",
+        }
+        data["dynamic_overlay"].pop("font_file", None)
+
+        # Unified fonts
+        data["fonts"] = {
+            **data.get("fonts", {}),
+            "source": self._fonts_source.get_active_id() or "folder",
+            "directory": self._fonts_directory.get_filename() or "",
+            "entries": self._fonts_entries.get_entries(),
         }
 
         # Download
@@ -587,6 +695,9 @@ class SettingsDialog(Gtk.Dialog):
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         self.config_path.write_text(tomli_w.dumps(data))
         self._raw = data
+        return sync_wallpaper_rotate_timer_interval(
+            int(self._interval_spin.get_value())
+        )
 
     def _show_info(self, msg: str, error: bool = False) -> None:
         self._infobar.set_message_type(

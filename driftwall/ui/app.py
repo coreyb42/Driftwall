@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -37,6 +38,8 @@ class DriftwallApp:
         self.config_path = config_path
         self._scan_images_item: Gtk.MenuItem | None = None
         self._scan_content_item: Gtk.MenuItem | None = None
+        self._pause_item: Gtk.CheckMenuItem | None = None
+        self._pause_quotes_item: Gtk.CheckMenuItem | None = None
         self._scan_images_running = False
         self._scan_content_running = False
         self._overlay_manager = None
@@ -56,11 +59,7 @@ class DriftwallApp:
         try:
             from driftwall.config import load_config
             config = load_config(Path(self.config_path) if self.config_path else None)
-            if config.dynamic_overlay.enabled and config.content.enabled:
-                from driftwall.dynamic_overlay import DynamicOverlayManager
-                self._overlay_manager = DynamicOverlayManager(config, config.resolved_db_path)
-                self._overlay_manager.start()
-                self._seed_overlay_manager_from_history(config)
+            self._start_overlay_manager(config)
         except Exception as e:
             log.warning("Dynamic overlay init failed: %s", e)
 
@@ -70,6 +69,18 @@ class DriftwallApp:
         next_item = Gtk.MenuItem(label="Next Wallpaper")
         next_item.connect("activate", self._on_next_wallpaper)
         menu.append(next_item)
+
+        pause_item = Gtk.CheckMenuItem(label="Pause Wallpaper")
+        pause_item.connect("toggled", self._on_pause_toggle)
+        menu.append(pause_item)
+        self._pause_item = pause_item
+
+        from driftwall.config import are_quotes_paused
+        pause_quotes_item = Gtk.CheckMenuItem(label="Pause Quotes")
+        pause_quotes_item.set_active(are_quotes_paused())
+        pause_quotes_item.connect("toggled", self._on_pause_quotes_toggle)
+        menu.append(pause_quotes_item)
+        self._pause_quotes_item = pause_quotes_item
 
         menu.append(Gtk.SeparatorMenuItem())
 
@@ -177,7 +188,44 @@ class DriftwallApp:
 
     # ── menu callbacks ───────────────────────────────────────────────────────
 
+    def _on_pause_toggle(self, item: Gtk.CheckMenuItem) -> None:
+        from driftwall.config import clear_pause_sentinel, set_pause_sentinel
+        if item.get_active():
+            try:
+                set_pause_sentinel()
+            except OSError as e:
+                log.warning("Failed to create pause sentinel: %s", e)
+        else:
+            try:
+                clear_pause_sentinel()
+            except OSError as e:
+                log.warning("Failed to remove pause sentinel: %s", e)
+        self._apply_overlay_pause_state()
+
+    def _on_pause_quotes_toggle(self, item: Gtk.CheckMenuItem) -> None:
+        from driftwall.config import clear_quotes_pause_sentinel, set_quotes_pause_sentinel
+        if self._pause_quotes_item is None:
+            self._pause_quotes_item = item
+        if item.get_active():
+            try:
+                set_quotes_pause_sentinel()
+            except OSError as e:
+                log.warning("Failed to create quote pause sentinel: %s", e)
+            self._apply_overlay_pause_state()
+        else:
+            try:
+                clear_quotes_pause_sentinel()
+            except OSError as e:
+                log.warning("Failed to remove quote pause sentinel: %s", e)
+            if self._overlay_manager is None:
+                self._restart_overlay_manager()
+            else:
+                self._apply_overlay_pause_state()
+
     def _on_next_wallpaper(self, _item: Gtk.MenuItem) -> None:
+        if self._pause_item is not None and self._pause_item.get_active():
+            return  # paused — no-op
+
         def _done(success: bool) -> None:
             if success and self._overlay_manager is not None:
                 self._update_overlay_manager()
@@ -274,24 +322,83 @@ class DriftwallApp:
 
     def _on_settings(self, _item: Gtk.MenuItem) -> None:
         from driftwall.ui.settings import SettingsDialog
-        dialog = SettingsDialog(config_path=self.config_path)
+        from driftwall.config import load_config
+
+        before = load_config(Path(self.config_path) if self.config_path else None)
+        saved_hook_called = False
+
+        def _on_saved() -> None:
+            nonlocal saved_hook_called
+            saved_hook_called = True
+            self._restart_overlay_manager()
+
+        dialog = SettingsDialog(config_path=self.config_path, on_saved=_on_saved)
         response = dialog.run()
         dialog.destroy()
         if response == Gtk.ResponseType.OK:
-            self._restart_overlay_manager()
+            after = load_config(Path(self.config_path) if self.config_path else None)
+            if self._fonts_config_fingerprint(before) != self._fonts_config_fingerprint(after):
+                self._reexec_self()
+                return
+            if not saved_hook_called:
+                self._restart_overlay_manager()
+
+    def _fonts_config_fingerprint(self, config) -> tuple:
+        entries = tuple(
+            sorted(
+                (
+                    str(e.get("path", "")).strip(),
+                    str(e.get("description", "")).strip(),
+                )
+                for e in config.fonts.entries
+            )
+        )
+        return (
+            config.fonts.source,
+            config.fonts.directory,
+            entries,
+        )
+
+    def _reexec_self(self) -> None:
+        """Re-exec the tray process so runtime font registration is rebuilt cleanly."""
+        argv = [sys.executable, "-m", "driftwall.ui"]
+        if self.config_path:
+            argv += ["--config", self.config_path]
+        os.execv(sys.executable, argv)
 
     def _restart_overlay_manager(self) -> None:
         """Stop the current overlay manager and start a fresh one with reloaded config."""
         if self._overlay_manager is not None:
-            self._overlay_manager.stop()
+            self._overlay_manager.stop(immediate=True)
             self._overlay_manager = None
         try:
             from driftwall.config import load_config
             config = load_config(Path(self.config_path) if self.config_path else None)
-            if config.dynamic_overlay.enabled and config.content.enabled:
-                from driftwall.dynamic_overlay import DynamicOverlayManager
-                self._overlay_manager = DynamicOverlayManager(config, config.resolved_db_path)
-                self._overlay_manager.start()
-                self._seed_overlay_manager_from_history(config)
+            self._start_overlay_manager(config)
         except Exception as e:
             log.warning("Dynamic overlay restart failed: %s", e)
+
+    def _start_overlay_manager(self, config) -> None:
+        if not (config.dynamic_overlay.enabled and config.content.enabled):
+            return
+        from driftwall.dynamic_overlay import DynamicOverlayManager
+        self._overlay_manager = DynamicOverlayManager(config, config.resolved_db_path)
+        self._overlay_manager.start()
+        self._seed_overlay_manager_from_history(config)
+        self._apply_overlay_pause_state()
+        if not self._overlay_pause_requested():
+            self._overlay_manager.spawn_now()
+
+    def _overlay_pause_requested(self) -> bool:
+        return bool(
+            (self._pause_item is not None and self._pause_item.get_active())
+            or (self._pause_quotes_item is not None and self._pause_quotes_item.get_active())
+        )
+
+    def _apply_overlay_pause_state(self) -> None:
+        if self._overlay_manager is None:
+            return
+        if self._overlay_pause_requested():
+            self._overlay_manager.pause()
+        else:
+            self._overlay_manager.resume()

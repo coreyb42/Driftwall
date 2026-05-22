@@ -126,14 +126,51 @@ class TestSearchContent(unittest.TestCase):
         self.assertEqual(kwargs["where"], {"source_path": "a"})
 
 
+class TestSearchContentEmbeddingBypass(unittest.TestCase):
+    def test_skips_ollama_when_query_embedding_provided(self):
+        fake_collection = MagicMock()
+        fake_collection.query.return_value = {
+            "ids": [[]],
+            "documents": [[]],
+            "metadatas": [[]],
+        }
+        # If ollama is called the test should fail — use a module that raises
+        bad_ollama = SimpleNamespace(Client=MagicMock(side_effect=AssertionError("ollama called")))
+        with patch.dict(sys.modules, {"ollama": bad_ollama}):
+            search_content(
+                query_text="irrelevant",
+                collection=fake_collection,
+                embed_model="nomic-embed-text",
+                host="http://localhost:11434",
+                query_embedding=[0.5, 0.5, 0.5],
+            )
+        kwargs = fake_collection.query.call_args.kwargs
+        self.assertEqual(kwargs["query_embeddings"], [[0.5, 0.5, 0.5]])
+
+
 class TestGetContentForImage(unittest.TestCase):
+    def _base_patches(self, cached_embedding=None):
+        """Return a list of patch context managers common to all get_content_for_image tests."""
+        return [
+            patch("driftwall.content_search.get_chroma_client", return_value=object()),
+            patch("driftwall.content_search.get_collection", return_value=object()),
+            patch("driftwall.content_search.get_image_embedding", return_value=cached_embedding),
+            patch("driftwall.content_search.upsert_image_embedding"),
+            patch("driftwall.content_search.list_content_source_paths", return_value=[]),
+        ]
+
     def test_uses_random_subset_of_sources_when_configured(self):
         config = Config()
         config.dynamic_overlay.random_source_subset_size = 3
         image = ImageRecord(one_sentence="A snowy mountain")
+        cached = [0.1, 0.2, 0.3]
 
         with patch("driftwall.content_search.get_chroma_client", return_value=object()), patch(
             "driftwall.content_search.get_collection", return_value=object()
+        ), patch(
+            "driftwall.content_search.get_image_embedding", return_value=cached
+        ), patch(
+            "driftwall.content_search.upsert_image_embedding"
         ), patch(
             "driftwall.content_search.list_content_source_paths",
             return_value=["s1", "s2", "s3", "s4", "s5"],
@@ -152,6 +189,53 @@ class TestGetContentForImage(unittest.TestCase):
             )
 
         self.assertEqual(mock_search.call_args.kwargs["source_paths"], ["s2", "s4", "s5"])
+
+    def test_uses_cached_embedding_without_calling_compute(self):
+        config = Config()
+        image = ImageRecord(one_sentence="A sunny meadow", file_hash="abc123")
+        cached = [0.9, 0.8, 0.7]
+
+        with patch("driftwall.content_search.get_chroma_client", return_value=object()), patch(
+            "driftwall.content_search.get_collection", return_value=object()
+        ), patch(
+            "driftwall.content_search.get_image_embedding", return_value=cached
+        ), patch(
+            "driftwall.content_search.upsert_image_embedding"
+        ) as mock_upsert, patch(
+            "driftwall.content_search.list_content_source_paths", return_value=[]
+        ), patch(
+            "driftwall.content_search.search_content", return_value=[]
+        ) as mock_search, patch(
+            "driftwall.image_embedder.compute_embedding",
+            side_effect=AssertionError("should not compute"),
+        ):
+            get_content_for_image(image=image, chroma_path=Path("/tmp/chroma"), config=config)
+
+        mock_upsert.assert_not_called()
+        self.assertEqual(mock_search.call_args.kwargs["query_embedding"], cached)
+
+    def test_lazy_backfill_when_no_cached_embedding(self):
+        config = Config()
+        image = ImageRecord(one_sentence="A rainy forest", file_hash="def456")
+        computed = [0.1, 0.2, 0.3]
+
+        with patch("driftwall.content_search.get_chroma_client", return_value=object()), patch(
+            "driftwall.content_search.get_collection", return_value=object()
+        ), patch(
+            "driftwall.content_search.get_image_embedding", return_value=None
+        ), patch(
+            "driftwall.content_search.upsert_image_embedding"
+        ) as mock_upsert, patch(
+            "driftwall.content_search.list_content_source_paths", return_value=[]
+        ), patch(
+            "driftwall.content_search.search_content", return_value=[]
+        ) as mock_search, patch(
+            "driftwall.image_embedder.compute_embedding", return_value=computed
+        ):
+            get_content_for_image(image=image, chroma_path=Path("/tmp/chroma"), config=config)
+
+        mock_upsert.assert_called_once()
+        self.assertEqual(mock_search.call_args.kwargs["query_embedding"], computed)
 
 
 if __name__ == "__main__":

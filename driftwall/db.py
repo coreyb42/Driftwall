@@ -90,6 +90,13 @@ CREATE TABLE IF NOT EXISTS content_sources (
     indexed_at  TEXT NOT NULL,
     chunk_count INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS image_embeddings (
+    file_hash   TEXT PRIMARY KEY REFERENCES images(file_hash) ON DELETE CASCADE,
+    embed_model TEXT NOT NULL,
+    embedding   TEXT NOT NULL,
+    computed_at TEXT NOT NULL
+);
 """
 
 
@@ -398,6 +405,60 @@ def get_content_stats(db_path: Path) -> dict[str, Any]:
         "total_chunks": sum(s["chunk_count"] for s in sources),
         "sources": sources,
     }
+
+
+def get_image_embedding(
+    db_path: Path, file_hash: str, embed_model: str
+) -> list[float] | None:
+    """Return the cached embedding for file_hash + embed_model, or None."""
+    import json
+    try:
+        with _connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT embedding FROM image_embeddings "
+                "WHERE file_hash = ? AND embed_model = ?",
+                (file_hash, embed_model),
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return json.loads(row[0]) if row else None
+
+
+def upsert_image_embedding(
+    db_path: Path, file_hash: str, embed_model: str, embedding: list[float]
+) -> None:
+    """Store a pre-computed embedding for an image."""
+    import json
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        conn.execute(
+            """INSERT INTO image_embeddings (file_hash, embed_model, embedding, computed_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(file_hash) DO UPDATE SET
+                   embed_model = excluded.embed_model,
+                   embedding   = excluded.embedding,
+                   computed_at = excluded.computed_at""",
+            (file_hash, embed_model, json.dumps(embedding), now),
+        )
+
+
+def get_images_missing_embeddings(db_path: Path, embed_model: str) -> list[ImageRecord]:
+    """Return all images that don't have an embedding for the given embed_model."""
+    try:
+        with _connect(db_path) as conn:
+            rows = conn.execute(
+                """SELECT i.* FROM images i
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM image_embeddings e
+                       WHERE e.file_hash = i.file_hash AND e.embed_model = ?
+                   )""",
+                (embed_model,),
+            ).fetchall()
+    except sqlite3.OperationalError:
+        # Table may not exist yet on old DBs
+        return []
+    return [_row_to_record(r) for r in rows]
 
 
 def get_stats(db_path: Path) -> dict[str, Any]:

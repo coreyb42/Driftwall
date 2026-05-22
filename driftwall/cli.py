@@ -8,9 +8,16 @@ import sys
 import time
 from pathlib import Path
 
-from .config import load_config
+from .config import (
+    PAUSE_SENTINEL_PATH,
+    clear_pause_sentinel,
+    is_paused,
+    load_config,
+    set_pause_sentinel,
+)
 from .db import get_stats, init_db
-from .overlay import apply_overlay, generate_overlay_text, pick_overlay_font, scan_font_dir
+from .font_selection import build_font_options, pick_font_for_context
+from .overlay import apply_overlay, generate_overlay_text
 from .scanner import scan_directory
 from .selector import select_image
 from .triggers import FilterCriteria, get_active_triggers, merge_criteria
@@ -52,6 +59,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 force_reclassify=args.force,
                 dry_run=args.dry_run,
                 progress_callback=progress,
+                show_output=getattr(args, "show_output", False),
             )
             print()  # newline after progress
             print(
@@ -81,6 +89,27 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 f"cached={total_result.already_classified} "
                 f"errors={total_result.skipped_errors}"
             )
+
+    if do_images and getattr(args, "embed", False) and not args.dry_run:
+        from .image_embedder import embed_all_images
+        embed_model = config.content.embed_model
+        print(f"Embedding images (model: {embed_model})...")
+
+        def embed_progress(done: int, total: int) -> None:
+            print(f"\r  {done}/{total}", end="", flush=True)
+
+        embed_result = embed_all_images(
+            db_path=db_path,
+            embed_model=embed_model,
+            host=config.ollama.host,
+            progress_callback=embed_progress,
+        )
+        print()
+        print(
+            f"  Embedded={embed_result.embedded} "
+            f"skipped={embed_result.skipped_no_text} "
+            f"errors={embed_result.errors}"
+        )
 
     if do_content:
         from .content_scanner import scan_content_dir
@@ -120,6 +149,10 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
 
 def cmd_rotate(args: argparse.Namespace) -> int:
+    if is_paused():
+        logging.info("Wallpaper rotation paused; skipping rotate.")
+        return 0
+
     config = load_config(args.config)
     db_path = config.resolved_db_path
 
@@ -178,24 +211,25 @@ def cmd_rotate(args: argparse.Namespace) -> int:
                 num_predict=config.ollama.num_predict,
             )
             if text:
-                font_file = config.overlay.font_file
-                if config.overlay.font_dir:
-                    font_paths = scan_font_dir(config.overlay.font_dir)
-                    if font_paths:
-                        chosen = pick_overlay_font(
-                            font_paths=font_paths,
-                            context=text,
-                            model=overlay_model,
-                            host=config.ollama.host,
-                        )
-                        font_file = str(chosen)
-                        logging.info("Overlay font chosen: %s", chosen.name)
+                font_file = ""
+                font_options = build_font_options(config)
+                if font_options:
+                    chosen = pick_font_for_context(
+                        options=font_options,
+                        context=text,
+                        purpose="wallpaper text overlay",
+                        model=overlay_model,
+                        host=config.ollama.host,
+                    )
+                    font_file = str(chosen)
+                    logging.info("Overlay font chosen: %s", chosen.name)
                 cache_path = Path.home() / ".cache" / "driftwall" / "overlay.jpg"
                 wallpaper_path = apply_overlay(
                     image_path=path,
                     text=text,
                     quadrant=overlay_quadrant,
                     font_file=font_file,
+                    font_size=config.overlay.font_size,
                     output_path=cache_path,
                     target_aspect_ratio=get_display_aspect_ratio(),
                 )
@@ -306,6 +340,20 @@ def cmd_config(args: argparse.Namespace) -> int:
     print("[triggers]")
     print(f"  enabled:     {config.triggers.enabled}")
     print()
+    print("[fonts]")
+    print(f"  source:      {config.fonts.source}")
+    print(f"  directory:   {config.fonts.directory or '(none)'}")
+    if config.fonts.entries:
+        print("  entries:")
+        for entry in config.fonts.entries:
+            desc = entry.get("description", "").strip()
+            if desc:
+                print(f"    - {entry.get('path', '')}  ({desc})")
+            else:
+                print(f"    - {entry.get('path', '')}")
+    else:
+        print("  entries:     []")
+    print()
     print("[overlay]")
     print(f"  enabled:     {config.overlay.enabled}")
     prompts = config.overlay.prompts
@@ -314,13 +362,12 @@ def cmd_config(args: argparse.Namespace) -> int:
     else:
         print(f"  prompts:     {prompts}")
     print(f"  model:       {config.overlay.model or '(same as ollama.model)'}")
+    print(f"  font_size:   {config.overlay.font_size or 'auto'}")
     quadrants = config.overlay.quadrants
     if len(quadrants) == 1:
         print(f"  quadrant:    {quadrants[0]}")
     else:
         print(f"  quadrants:   {quadrants}")
-    print(f"  font_file:   {config.overlay.font_file or '(auto)'}")
-    print(f"  font_dir:    {config.overlay.font_dir or '(none)'}")
     print()
     print("[download]")
     print(f"  output_dir:  {config.download.output_dir}")
@@ -340,12 +387,14 @@ def cmd_config(args: argparse.Namespace) -> int:
     print(f"  random_source_subset_size: {config.dynamic_overlay.random_source_subset_size}")
     print(f"  font_size:           {config.dynamic_overlay.font_size}px")
     print(f"  max_screen_fraction: {config.dynamic_overlay.max_screen_fraction}")
-    print(f"  font_file:           {config.dynamic_overlay.font_file or '(auto)'}")
 
     return 0
 
 
 def cmd_fetch(args: argparse.Namespace) -> int:
+    if args.source == "nasa":
+        return _cmd_fetch_nasa(args)
+
     from .downloader import download_met_artworks, met_list_departments, met_output_subdir
 
     if args.source != "met":
@@ -410,11 +459,151 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_fetch_nasa(args: argparse.Namespace) -> int:
+    from datetime import datetime
+
+    config = load_config(args.config)
+    output_dir = args.output_dir or Path("/mnt/Central Storage/Wallpapers/Desktop/Downloads/NASA")
+    t_start = time.monotonic()
+    started_at = datetime.now().strftime("%H:%M:%S")
+
+    if getattr(args, "reclassify", False):
+        from .nasa_downloader import reclassify_nasa_images
+
+        print(f"Started at {started_at}", flush=True)
+        result = reclassify_nasa_images(
+            output_dir=output_dir,
+            config=config,
+            db_path=config.resolved_db_path,
+            dry_run=args.dry_run,
+            progress_callback=lambda msg: None,
+            show_output=getattr(args, "show_output", False),
+        )
+
+        elapsed = time.monotonic() - t_start
+        finished_at = datetime.now().strftime("%H:%M:%S")
+        mins, secs = divmod(int(elapsed), 60)
+        elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+
+        print(flush=True)
+        print(f"Started:                   {started_at}", flush=True)
+        print(f"Finished:                  {finished_at}  (elapsed: {elapsed_str})", flush=True)
+        print(flush=True)
+        print(f"Re-classified:             {result.reclassified}", flush=True)
+        print(f"Flagged (has people):      {result.flagged_has_people}", flush=True)
+        print(f"Skipped (no API metadata): {result.skipped_no_metadata}", flush=True)
+        print(f"Errors:                    {result.errors}", flush=True)
+        return 0
+
+    from .nasa_downloader import download_nasa_images
+
+    if not args.search:
+        print("Error: --search QUERY is required for --source nasa", file=sys.stderr)
+        return 1
+
+    classify = not getattr(args, "no_classify", False)
+
+    print(f"Started at {started_at}", flush=True)
+    result = download_nasa_images(
+        output_dir=output_dir,
+        query=args.search,
+        limit=args.limit,
+        dry_run=args.dry_run,
+        classify=classify,
+        config=config,
+        db_path=config.resolved_db_path,
+        progress_callback=lambda msg: None,  # already printed inside
+        show_output=getattr(args, "show_output", False),
+    )
+
+    elapsed = time.monotonic() - t_start
+    finished_at = datetime.now().strftime("%H:%M:%S")
+    mins, secs = divmod(int(elapsed), 60)
+    elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+
+    print(flush=True)
+    print(f"Started:                      {started_at}", flush=True)
+    print(f"Finished:                     {finished_at}  (elapsed: {elapsed_str})", flush=True)
+    print(flush=True)
+    print(f"Downloaded:                   {result.downloaded}", flush=True)
+    print(f"Skipped (not landscape):      {result.skipped_not_landscape}", flush=True)
+    print(f"Skipped (has people):         {result.skipped_has_people}", flush=True)
+    print(f"Skipped (no image/manifest):  {result.skipped_no_image}", flush=True)
+    print(f"Skipped (already exist):      {result.skipped_existing}", flush=True)
+    print(f"Errors:                       {result.errors}", flush=True)
+
+    if result.downloaded > 0 and not args.dry_run:
+        print(f"\nImages saved to: {output_dir}", flush=True)
+        if classify:
+            print("Images are already classified and in the DB.", flush=True)
+        else:
+            print("Run 'driftwall scan' to classify the downloaded images.", flush=True)
+
+    return 0
+
+
+def cmd_embed(args: argparse.Namespace) -> int:
+    from .image_embedder import embed_all_images
+
+    config = load_config(args.config)
+    db_path = config.resolved_db_path
+    embed_model = config.content.embed_model
+
+    if not db_path.exists():
+        print(f"No database at {db_path}. Run 'driftwall scan' first.", file=sys.stderr)
+        return 1
+
+    init_db(db_path)
+
+    if args.dry_run:
+        from .db import get_images_missing_embeddings, query_images
+        images = query_images(db_path, [], []) if args.force else get_images_missing_embeddings(db_path, embed_model)
+        print(f"Would embed {len(images)} image(s) using model '{embed_model}' (dry run)")
+        return 0
+
+    print(f"Computing embeddings using model '{embed_model}'...")
+
+    def progress(done: int, total: int) -> None:
+        print(f"\r  {done}/{total}", end="", flush=True)
+
+    result = embed_all_images(
+        db_path=db_path,
+        embed_model=embed_model,
+        host=config.ollama.host,
+        force=args.force,
+        progress_callback=progress,
+    )
+    print()
+    print(
+        f"  Total={result.total} "
+        f"embedded={result.embedded} "
+        f"skipped={result.skipped_no_text} "
+        f"errors={result.errors}"
+    )
+    return 0
+
+
+def cmd_pause(args: argparse.Namespace) -> int:
+    set_pause_sentinel()
+    print("Wallpaper rotation paused.")
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    clear_pause_sentinel()
+    print("Wallpaper rotation resumed.")
+    return 0
+
+
 def cmd_ui(args: argparse.Namespace) -> int:
     import os
     import sys
     import driftwall as _dw
     from pathlib import Path
+
+    # Tray launch implies an active session — clear any stale pause sentinel so
+    # rotations resume even if the tray was killed mid-pause.
+    clear_pause_sentinel()
 
     # The editable install uses a path-hook finder that system python3 won't load
     # via PYTHONPATH, so we add the project root explicitly alongside the venv's
@@ -451,6 +640,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan.add_argument("--dry-run", action="store_true", help="List files without writing")
     p_scan.add_argument("--images", action="store_true", help="Scan image directories (explicit)")
     p_scan.add_argument("--content", action="store_true", help="Scan content directory for quotes/text")
+    p_scan.add_argument("--embed", action="store_true", help="Compute image embeddings after scanning (requires --images or default scan)")
+    p_scan.add_argument("--show-output", action="store_true", help="Print raw classifier JSON for each newly classified image")
 
     # rotate
     p_rotate = sub.add_parser("rotate", help="Select and set wallpaper once")
@@ -473,16 +664,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     # fetch
     p_fetch = sub.add_parser("fetch", help="Download artworks from external art APIs")
-    p_fetch.add_argument("--source", default="met", choices=["met"], help="Art collection source (default: met)")
-    p_fetch.add_argument("--list-departments", action="store_true", help="List available Met departments and exit")
-    p_fetch.add_argument("--department", type=int, metavar="ID", help="Met department ID to fetch from")
-    p_fetch.add_argument("--search", metavar="QUERY", help="Search query string")
+    p_fetch.add_argument("--source", default="met", choices=["met", "nasa"], help="Art collection source (default: met)")
+    p_fetch.add_argument("--list-departments", action="store_true", help="[met] List available Met departments and exit")
+    p_fetch.add_argument("--department", type=int, metavar="ID", help="[met] Met department ID to fetch from")
+    p_fetch.add_argument("--search", metavar="QUERY", help="Search query string (required for --source nasa)")
     p_fetch.add_argument("--limit", type=int, default=50, metavar="N", help="Max landscape images to save (default: 50)")
-    p_fetch.add_argument("--output-dir", type=Path, metavar="DIR", help="Directory to save images (default: from config)")
+    p_fetch.add_argument("--output-dir", type=Path, metavar="DIR", help="Directory to save images (default: from config / NASA default)")
     p_fetch.add_argument("--dry-run", action="store_true", help="Log without writing files")
+    p_fetch.add_argument("--no-classify", action="store_true", help="[nasa] Skip LLM classification (faster, no people filter)")
+    p_fetch.add_argument("--reclassify", action="store_true", help="[nasa] Re-classify images already on disk using API metadata (no download)")
+    p_fetch.add_argument("--show-output", action="store_true", help="Print raw classifier JSON for each classified image")
+
+    # embed
+    p_embed = sub.add_parser("embed", help="Pre-compute image embeddings for content search")
+    p_embed.add_argument("--force", action="store_true", help="Re-embed all images, even if already computed")
+    p_embed.add_argument("--dry-run", action="store_true", help="Show how many images would be embedded")
 
     # ui
     sub.add_parser("ui", help="Launch system tray UI (GTK3)")
+
+    # pause / resume
+    sub.add_parser("pause", help="Pause wallpaper rotation (tray menu equivalent)")
+    sub.add_parser("resume", help="Resume wallpaper rotation")
 
     return parser
 
@@ -499,7 +702,10 @@ def main() -> None:
         "status": cmd_status,
         "config": cmd_config,
         "fetch": cmd_fetch,
+        "embed": cmd_embed,
         "ui": cmd_ui,
+        "pause": cmd_pause,
+        "resume": cmd_resume,
     }
 
     handler = handlers.get(args.command)

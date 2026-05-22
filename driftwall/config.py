@@ -17,6 +17,34 @@ else:
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "driftwall" / "config.toml"
 DEFAULT_PROMPT_PATH = Path(__file__).parent.parent / "photo_class_prompt.txt"
+PAUSE_SENTINEL_PATH = Path.home() / ".local" / "share" / "driftwall" / "paused"
+QUOTES_PAUSE_SENTINEL_PATH = Path.home() / ".local" / "share" / "driftwall" / "quotes_paused"
+
+
+def is_paused() -> bool:
+    return PAUSE_SENTINEL_PATH.exists()
+
+
+def set_pause_sentinel() -> None:
+    PAUSE_SENTINEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PAUSE_SENTINEL_PATH.touch()
+
+
+def clear_pause_sentinel() -> None:
+    PAUSE_SENTINEL_PATH.unlink(missing_ok=True)
+
+
+def are_quotes_paused() -> bool:
+    return QUOTES_PAUSE_SENTINEL_PATH.exists()
+
+
+def set_quotes_pause_sentinel() -> None:
+    QUOTES_PAUSE_SENTINEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    QUOTES_PAUSE_SENTINEL_PATH.touch()
+
+
+def clear_quotes_pause_sentinel() -> None:
+    QUOTES_PAUSE_SENTINEL_PATH.unlink(missing_ok=True)
 
 
 @dataclass
@@ -27,6 +55,16 @@ class OllamaConfig:
     host: str = "http://localhost:11434"
     max_image_pixels: int = 1344  # longest edge before sending to model; 0 = no resize
     num_predict: int = 48000  # max tokens to predict (Ollama num_predict)
+
+
+@dataclass
+class GrokConfig:
+    model: str = "grok-4-1-fast-non-reasoning"
+    max_image_pixels: int = 1344
+    api_key: str = ""        # falls back to XAI_API_KEY env var
+    base_url: str = "https://api.x.ai/v1"
+    timeout: int = 120
+    concurrency: int = 4
 
 
 @dataclass
@@ -62,8 +100,9 @@ class OverlayConfig:
     enabled: bool = False
     prompts: list[str] = field(default_factory=lambda: ["a haiku"])
     model: str = "lfm2.5-thinking"
-    font_file: str = ""   # path to a specific font file; empty = auto-detect from system candidates
-    font_dir: str = ""    # directory to scan recursively for .ttf fonts; LLM picks one
+    font_size: int = 0  # px; 0 = auto-scale from image size
+    font_file: str = ""   # deprecated: use [fonts]
+    font_dir: str = ""    # deprecated: use [fonts]
     quadrants: list[str] = field(default_factory=lambda: ["bottom-right"])  # top-left, top-right, bottom-left, bottom-right
 
 
@@ -90,7 +129,24 @@ class DynamicOverlayConfig:
     random_source_subset_size: int = 0  # 0 = disabled; otherwise sample N sources/query
     font_size: int = 18          # px
     max_screen_fraction: float = 0.10
-    font_file: str = ""          # empty = auto-detect
+    font_file: str = ""          # deprecated: use [fonts]
+    # Extra margin on each edge of the overlay area, on top of whatever GDK reports
+    # via _NET_WORKAREA. Defaults give breathing room from the GNOME panel/dock when
+    # struts under-report (e.g. dash-to-dock on Mutter+Wayland).
+    reserved_top_px: int = 16
+    reserved_bottom_px: int = 16
+    reserved_left_px: int = 16
+    reserved_right_px: int = 16
+
+
+@dataclass
+class FontsConfig:
+    source: str = "folder"  # "folder" or "list"
+    directory: str = ""
+    entries: list[dict[str, str]] = field(default_factory=list)  # [{path, description}]
+    # Drop fonts whose name suggests they're decorative/unreadable for body text
+    # (Stencil, Display, Brush, Thin, ExtraLight, etc). See font_readability.py.
+    filter_unreadable: bool = True
 
 
 @dataclass
@@ -98,7 +154,9 @@ class Config:
     image_dirs: list[Path] = field(default_factory=lambda: [Path.home() / "Pictures"])
     db_path: Path | None = None
     prompt_path: Path = field(default_factory=lambda: DEFAULT_PROMPT_PATH)
+    classifier_backend: str = "grok"  # "grok" or "ollama"
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
+    grok: GrokConfig = field(default_factory=GrokConfig)
     rotation: RotationConfig = field(default_factory=RotationConfig)
     filters: FilterConfig = field(default_factory=FilterConfig)
     triggers: TriggerConfig = field(default_factory=TriggerConfig)
@@ -106,6 +164,7 @@ class Config:
     download: DownloadConfig = field(default_factory=DownloadConfig)
     content: ContentConfig = field(default_factory=ContentConfig)
     dynamic_overlay: DynamicOverlayConfig = field(default_factory=DynamicOverlayConfig)
+    fonts: FontsConfig = field(default_factory=FontsConfig)
 
     @property
     def resolved_db_path(self) -> Path:
@@ -153,6 +212,8 @@ def load_config(path: Path | None = None) -> Config:
     db_path = Path(db_path_raw) if db_path_raw else None
     prompt_path = Path(raw.get("prompt_path", str(DEFAULT_PROMPT_PATH)))
 
+    classifier_backend = str(raw.get("classifier_backend", "grok")).lower()
+
     ollama_raw = raw.get("ollama", {})
     ollama = OllamaConfig(
         model=ollama_raw.get("model", "qwen3-vl:30b"),
@@ -161,6 +222,16 @@ def load_config(path: Path | None = None) -> Config:
         host=ollama_raw.get("host", "http://localhost:11434"),
         max_image_pixels=ollama_raw.get("max_image_pixels", 1344),
         num_predict=ollama_raw.get("num_predict", 48000),
+    )
+
+    grok_raw = raw.get("grok", {})
+    grok = GrokConfig(
+        model=grok_raw.get("model", "grok-4-1-fast-non-reasoning"),
+        max_image_pixels=grok_raw.get("max_image_pixels", 1344),
+        api_key=grok_raw.get("api_key", ""),
+        base_url=grok_raw.get("base_url", "https://api.x.ai/v1"),
+        timeout=grok_raw.get("timeout", 120),
+        concurrency=grok_raw.get("concurrency", 4),
     )
 
     rotation_raw = raw.get("rotation", {})
@@ -202,6 +273,7 @@ def load_config(path: Path | None = None) -> Config:
         enabled=overlay_raw.get("enabled", False),
         prompts=overlay_prompts,
         model=overlay_raw.get("model", "lfm2.5-thinking"),
+        font_size=overlay_raw.get("font_size", 0),
         font_file=overlay_raw.get("font_file", ""),
         font_dir=overlay_raw.get("font_dir", ""),
         quadrants=overlay_quadrants,
@@ -232,13 +304,59 @@ def load_config(path: Path | None = None) -> Config:
         font_size=dyn_raw.get("font_size", 18),
         max_screen_fraction=float(dyn_raw.get("max_screen_fraction", 0.10)),
         font_file=dyn_raw.get("font_file", ""),
+        reserved_top_px=int(dyn_raw.get("reserved_top_px", 16)),
+        reserved_bottom_px=int(dyn_raw.get("reserved_bottom_px", 16)),
+        reserved_left_px=int(dyn_raw.get("reserved_left_px", 16)),
+        reserved_right_px=int(dyn_raw.get("reserved_right_px", 16)),
+    )
+
+    # Unified font selection config. Prefer [fonts], but keep legacy fallback so
+    # existing configs continue to work.
+    fonts_raw = raw.get("fonts", {})
+    fonts_entries: list[dict[str, str]] = []
+    for entry in fonts_raw.get("entries", []):
+        if not isinstance(entry, dict):
+            continue
+        path = str(entry.get("path", "")).strip()
+        if not path:
+            continue
+        desc = str(entry.get("description", "")).strip()
+        fonts_entries.append({"path": path, "description": desc})
+
+    legacy_files: list[str] = []
+    for legacy_path in (overlay.font_file, dynamic_overlay.font_file):
+        if legacy_path and legacy_path not in legacy_files:
+            legacy_files.append(legacy_path)
+    if not fonts_entries and legacy_files:
+        fonts_entries = [{"path": p, "description": ""} for p in legacy_files]
+
+    fonts_directory = str(fonts_raw.get("directory", "")).strip()
+    if not fonts_directory:
+        fonts_directory = overlay.font_dir
+
+    fonts_source = str(fonts_raw.get("source", "")).strip().lower()
+    if fonts_source not in {"folder", "list"}:
+        if fonts_entries:
+            fonts_source = "list"
+        elif fonts_directory:
+            fonts_source = "folder"
+        else:
+            fonts_source = "folder"
+
+    fonts = FontsConfig(
+        source=fonts_source,
+        directory=fonts_directory,
+        entries=fonts_entries,
+        filter_unreadable=bool(fonts_raw.get("filter_unreadable", True)),
     )
 
     return Config(
         image_dirs=image_dirs,
         db_path=db_path,
         prompt_path=prompt_path,
+        classifier_backend=classifier_backend,
         ollama=ollama,
+        grok=grok,
         rotation=rotation,
         filters=filters,
         triggers=triggers,
@@ -246,4 +364,5 @@ def load_config(path: Path | None = None) -> Config:
         download=download,
         content=content,
         dynamic_overlay=dynamic_overlay,
+        fonts=fonts,
     )

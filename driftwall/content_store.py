@@ -15,6 +15,13 @@ class ContentChunk:
     chunk_index: int
     metadata: dict = field(default_factory=dict)  # author, date, source_title, etc.
 
+    @property
+    def drillable(self) -> bool:
+        """True if we can show this chunk in surrounding document context."""
+        if self.source_type == "quote":
+            return False
+        return Path(self.source_path).suffix.lower() != ".pdf"
+
 
 def get_chroma_client(chroma_path: Path):  # type: ignore[return]
     """Return a persistent ChromaDB client at chroma_path."""

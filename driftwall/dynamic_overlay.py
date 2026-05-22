@@ -7,6 +7,7 @@ import random
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -15,6 +16,15 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("Pango", "1.0")
 from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
+
+from .font_selection import build_font_options, pick_font_for_context
+from .overlay import register_font_with_fontconfig, resolve_font_family
+from .windowing import (
+    OverlayBounds,
+    compute_overlay_bounds,
+    configure_overlay_window_layer,
+    zone_rect,
+)
 
 log = logging.getLogger(__name__)
 
@@ -35,14 +45,12 @@ _QUADRANT_ZONES: dict[str, set[int]] = {
     "bottom-right": {7, 10, 11},
 }
 
+# Internal alias kept for the rest of this module.
+_zone_rect = zone_rect
 
-def _zone_rect(zone: int, screen_w: int, screen_h: int) -> tuple[int, int, int, int]:
-    """Return (x, y, w, h) for a zone cell in a 4-col × 3-row grid."""
-    col = zone % 4
-    row = zone // 4
-    cell_w = screen_w // 4
-    cell_h = screen_h // 3
-    return col * cell_w, row * cell_h, cell_w, cell_h
+# Inset between zone cells (and between work-area edge and overlay edge).
+# Keeps adjacent overlays from touching and gives breathing room from panels.
+_INTER_ZONE_GAP_PX = 12
 
 
 class FloatingOverlay(Gtk.Window):
@@ -59,24 +67,16 @@ class FloatingOverlay(Gtk.Window):
         font_size: int,
         font_file: str,
         on_destroyed: Callable | None = None,
+        chunk=None,
+        on_read: Callable | None = None,
     ) -> None:
         super().__init__()
         self._on_destroyed = on_destroyed
         self._fade_id: int | None = None
-        self._relower_id: int | None = None
         self._target_opacity = 1.0
 
-        self.set_type_hint(Gdk.WindowTypeHint.NORMAL)
         self.set_decorated(False)
-        self.set_skip_taskbar_hint(True)
-        self.set_skip_pager_hint(True)
-        self.set_accept_focus(False)
-        # Do NOT use set_keep_below() — on Mutter/GNOME it pushes windows below
-        # the desktop compositor layer, making them invisible. Instead we call
-        # gdk_win.lower() in fade_in() after the window is realized, which sends
-        # XLowerWindow and places the overlay at the bottom of the normal stack
-        # (above the desktop, below other application windows).
-        self.stick()
+        configure_overlay_window_layer(self, Gdk)
 
         # RGBA transparency
         screen = self.get_screen()
@@ -89,7 +89,7 @@ class FloatingOverlay(Gtk.Window):
 
         # CSS: transparent window body + dark rounded box for content
         attr_size = max(10, int(font_size * 0.75))
-        font_family = Path(font_file).stem if font_file else "Sans"
+        font_family = resolve_font_family(font_file)
         css_data = f"""
             window.driftwall-overlay {{
                 background-color: transparent;
@@ -102,14 +102,21 @@ class FloatingOverlay(Gtk.Window):
             }}
             .dw-overlay-text {{
                 color: rgba(255, 255, 255, 0.95);
-                font-family: {font_family};
+                font-family: "{font_family}";
                 font-size: {font_size}px;
             }}
             .dw-overlay-attr {{
                 color: rgba(210, 210, 210, 0.90);
-                font-family: {font_family};
+                font-family: "{font_family}";
                 font-size: {attr_size}px;
                 font-style: italic;
+            }}
+            .dw-overlay-read-btn {{
+                color: rgba(210, 210, 210, 0.75);
+                background: transparent;
+                border: none;
+                padding: 0px 4px;
+                font-size: 13px;
             }}
         """.encode()
         css_provider = Gtk.CssProvider()
@@ -122,15 +129,26 @@ class FloatingOverlay(Gtk.Window):
         box.get_style_context().add_class("dw-overlay-box")
         box.get_style_context().add_provider(css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
-        text_label = Gtk.Label(label=text)
+        # Truncate long quotes so the rendered window doesn't bleed past its
+        # zone (which would visually overlap the next zone's overlay). A "more"
+        # button — when chunk.drillable — opens the full text in the reader.
+        chars_per_line = max(20, max_width // max(1, font_size // 2 + 1))
+        line_height_px = max(1, int(font_size * 1.4))
+        # Reserve ~3 lines of vertical budget for attribution + button + padding.
+        budget_lines = max(3, max_height // line_height_px - 3)
+        max_chars = max(80, budget_lines * chars_per_line)
+        display_text = _truncate_for_display(text, max_chars)
+
+        text_label = Gtk.Label(label=display_text)
         text_label.set_xalign(0.0)
         text_label.set_line_wrap(True)
         text_label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        # width_chars gives GTK a reference width so height-for-width works correctly
-        chars_per_line = max(20, max_width // max(1, font_size // 2 + 1))
         text_label.set_max_width_chars(chars_per_line)
         text_label.get_style_context().add_class("dw-overlay-text")
         text_label.get_style_context().add_provider(css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        text_desc = Pango.FontDescription()
+        text_desc.set_family(font_family)
+        text_label.override_font(text_desc)
         box.pack_start(text_label, False, False, 0)
 
         if attribution:
@@ -140,12 +158,33 @@ class FloatingOverlay(Gtk.Window):
             attr_label.set_max_width_chars(chars_per_line)
             attr_label.get_style_context().add_class("dw-overlay-attr")
             attr_label.get_style_context().add_provider(css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            attr_desc = Pango.FontDescription()
+            attr_desc.set_family(font_family)
+            attr_desc.set_style(Pango.Style.ITALIC)
+            attr_label.override_font(attr_desc)
             box.pack_start(attr_label, False, False, 0)
 
+        if chunk is not None and chunk.drillable and on_read is not None:
+            btn = Gtk.Button(label="\u22ef")  # ⋯
+            btn.get_style_context().add_class("dw-overlay-read-btn")
+            btn.get_style_context().add_provider(css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            btn.set_halign(Gtk.Align.END)
+            btn.set_relief(Gtk.ReliefStyle.NONE)
+            btn.connect("clicked", lambda _: GLib.idle_add(on_read, chunk))
+            box.pack_start(btn, False, False, 0)
+
+        self._chunk = chunk
+        self._anchor_x = screen_x
+        self._anchor_y = screen_y
+        self._max_w = max_width
+        self._max_h = max_height
         self.add(box)
-        # set_size_request fixes the width; set_resizable(False) lets GTK compute
-        # natural height correctly via height-for-width on the wrapping labels.
-        self.set_size_request(max_width, -1)
+        # Let GTK natural-size the window from the wrapping labels' max_width_chars.
+        # We deliberately do NOT call set_size_request: that would freeze the window
+        # at the maximum allowed width, leaving lots of empty transparent space and
+        # making adjacent overlays feel cramped. _clamp_to_screen below pulls the
+        # window back inside its allowed bounds once GTK has computed the natural
+        # size on show_all().
         self.set_resizable(False)
         self.move(screen_x, screen_y)
         self.set_opacity(0.0)
@@ -154,22 +193,45 @@ class FloatingOverlay(Gtk.Window):
 
     def fade_in(self) -> None:
         self.show_all()
-        # Lower to bottom of normal window stack on initial show, then keep re-lowering
-        # so the overlay stays below any window raised after us. gdk_win.lower() is a
-        # one-shot XLowerWindow call; without the periodic re-lower, raising any other
-        # window leaves our overlay above it until the next explicit lower() call.
-        gdk_win = self.get_window()
-        if gdk_win:
-            gdk_win.lower()
-        self._relower_id = GLib.timeout_add(1500, self._relower)
+        GLib.idle_add(self._clamp_to_screen)
         self._target_opacity = 1.0
         self._fade_id = GLib.timeout_add(30, self._step_fade_in)
 
-    def _relower(self) -> bool:
-        gdk_win = self.get_window()
-        if gdk_win:
-            gdk_win.lower()
-            return True
+    def _clamp_to_screen(self) -> bool:
+        """After GTK natural-sizes the window, snap it back inside its allowed bounds.
+
+        Bounds are the zone's (anchor_x, anchor_y) corner with size (max_w, max_h),
+        which the manager already insets from the work area. We never let the
+        window cross beyond the full screen either, as a hard backstop.
+        """
+        x, y = self.get_position()
+        w, h = self.get_size()
+        screen = self.get_screen()
+        sw = screen.get_width()
+        sh = screen.get_height()
+
+        # Allowed box: anchor + max_w/max_h (assigned by manager); fall back to screen.
+        ax = getattr(self, "_anchor_x", 0)
+        ay = getattr(self, "_anchor_y", 0)
+        mw = getattr(self, "_max_w", sw)
+        mh = getattr(self, "_max_h", sh)
+
+        # Right/bottom limits inside the zone
+        zone_right = ax + max(mw, w)
+        zone_bottom = ay + max(mh, h)
+
+        new_x = max(ax, min(x, zone_right - w))
+        new_y = max(ay, min(y, zone_bottom - h))
+        # Hard backstop — never poke past the screen
+        new_x = max(0, min(new_x, sw - w))
+        new_y = max(0, min(new_y, sh - h))
+
+        if new_x != x or new_y != y:
+            log.debug(
+                "Clamping overlay from (%d,%d) to (%d,%d) size=%dx%d zone=(%d,%d %dx%d)",
+                x, y, new_x, new_y, w, h, ax, ay, mw, mh,
+            )
+            self.move(new_x, new_y)
         return False
 
     def _step_fade_in(self) -> bool:
@@ -182,9 +244,6 @@ class FloatingOverlay(Gtk.Window):
         return True
 
     def fade_out(self) -> None:
-        if self._relower_id is not None:
-            GLib.source_remove(self._relower_id)
-            self._relower_id = None
         if self._fade_id is not None:
             GLib.source_remove(self._fade_id)
         self._fade_id = GLib.timeout_add(30, self._step_fade_out)
@@ -217,30 +276,54 @@ class DynamicOverlayManager:
     def __init__(self, config, db_path: Path) -> None:
         self._config = config
         self._db_path = db_path
+        self._font_options = build_font_options(config)
+        if self._font_options:
+            registered = 0
+            for opt in self._font_options:
+                if register_font_with_fontconfig(str(opt.path)):
+                    registered += 1
+            log.info(
+                "Dynamic overlay font preload: %d/%d fonts registered",
+                registered,
+                len(self._font_options),
+            )
         self._current_image = None  # ImageRecord of the current wallpaper
-        # (overlay, expire_time, zone, chunk_id)
-        self._active: list[tuple[FloatingOverlay, float, int, str]] = []
+        # (overlay, expire_time, zone, chunk)  -- chunk.id used for dedup
+        self._active: list[tuple] = []
         self._occupied_zones: set[int] = set()
         self._recently_shown: deque[str] = deque(maxlen=self._RECENT_MAXLEN)
         self._fetch_in_progress = False
+        self._paused = False
         self._spawn_timer_id: int | None = None
         self._expire_timer_id: int | None = None
         self._lock = threading.Lock()
 
-        # Use the monitor work area so overlays don't overlap system panels
+        # Use the monitor work area so overlays don't overlap system panels.
+        # reserved_*_px add extra inset on each edge for docks/panels that don't
+        # register X11 struts properly (the GDK work area would include them).
         display = Gdk.Display.get_default()
         monitor = display.get_primary_monitor() if display else None
+        cfg_do = config.dynamic_overlay
         if monitor:
             wa = monitor.get_workarea()
-            self._work_x = wa.x
-            self._work_y = wa.y
-            self._screen_w = wa.width
-            self._screen_h = wa.height
+            self._work_x = wa.x + cfg_do.reserved_left_px
+            self._work_y = wa.y + cfg_do.reserved_top_px
+            self._screen_w = wa.width - cfg_do.reserved_left_px - cfg_do.reserved_right_px
+            self._screen_h = wa.height - cfg_do.reserved_top_px - cfg_do.reserved_bottom_px
+            log.debug(
+                "Work area: gdk=(%d,%d %dx%d)  reserved l=%d r=%d t=%d b=%d  "
+                "effective origin=(%d,%d) size=%dx%d",
+                wa.x, wa.y, wa.width, wa.height,
+                cfg_do.reserved_left_px, cfg_do.reserved_right_px,
+                cfg_do.reserved_top_px, cfg_do.reserved_bottom_px,
+                self._work_x, self._work_y, self._screen_w, self._screen_h,
+            )
         else:
-            self._work_x = 0
-            self._work_y = 0
-            self._screen_w = 1920
-            self._screen_h = 1052
+            self._work_x = cfg_do.reserved_left_px
+            self._work_y = cfg_do.reserved_top_px
+            self._screen_w = 1920 - cfg_do.reserved_left_px - cfg_do.reserved_right_px
+            self._screen_h = 1052 - cfg_do.reserved_top_px - cfg_do.reserved_bottom_px
+            log.warning("No primary monitor detected; falling back to 1920x1052 defaults")
 
         # Zones to avoid because the static text overlay appears there
         self._static_overlay_zones: set[int] = set()
@@ -254,7 +337,7 @@ class DynamicOverlayManager:
         # Expire check runs more frequently so overlays don't linger past their lifetime
         self._expire_timer_id = GLib.timeout_add_seconds(5, self._expire_check)
 
-    def stop(self) -> None:
+    def stop(self, immediate: bool = False) -> None:
         for attr in ("_spawn_timer_id", "_expire_timer_id"):
             tid = getattr(self, attr, None)
             if tid is not None:
@@ -262,8 +345,30 @@ class DynamicOverlayManager:
                 setattr(self, attr, None)
         with self._lock:
             active = list(self._active)
-        for overlay, _exp, _zone, _cid in active:
+        for overlay, _exp, _zone, _chunk in active:
+            if immediate:
+                GLib.idle_add(overlay.destroy)
+            else:
+                GLib.idle_add(overlay.fade_out)
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    def pause(self) -> None:
+        """Pause spawning and fade out all active overlays."""
+        with self._lock:
+            self._paused = True
+            active = list(self._active)
+        log.debug("DynamicOverlayManager paused")
+        for overlay, _exp, _zone, _chunk in active:
             GLib.idle_add(overlay.fade_out)
+
+    def resume(self) -> None:
+        """Resume spawning overlays."""
+        with self._lock:
+            self._paused = False
+        log.debug("DynamicOverlayManager resumed")
 
     def set_image(self, image) -> None:
         """Record the current wallpaper image and fade out existing overlays."""
@@ -271,20 +376,26 @@ class DynamicOverlayManager:
             self._current_image = image
             active = list(self._active)
         log.debug("set_image: %s", getattr(image, "path", image))
-        for overlay, _exp, _zone, _cid in active:
+        for overlay, _exp, _zone, _chunk in active:
             GLib.idle_add(overlay.fade_out)
+
+    def spawn_now(self) -> None:
+        """Attempt one immediate spawn on the GLib loop."""
+        GLib.idle_add(self._spawn_one)
 
     def _expire_check(self) -> bool:
         """Fade out overlays that have exceeded their lifetime. Runs every 5 seconds."""
         now = time.monotonic()
         with self._lock:
             still_active = []
-            for overlay, exp, zone, cid in self._active:
+            for overlay, exp, zone, chunk in self._active:
                 if now >= exp:
                     GLib.idle_add(overlay.fade_out)
-                    self._occupied_zones.discard(zone)
+                    # Mark as fading (inf expire) so we don't re-trigger fade_out;
+                    # keep zone occupied until _on_destroyed fires after fade completes.
+                    still_active.append((overlay, float("inf"), zone, chunk))
                 else:
-                    still_active.append((overlay, exp, zone, cid))
+                    still_active.append((overlay, exp, zone, chunk))
             self._active = still_active
         return True
 
@@ -296,10 +407,10 @@ class DynamicOverlayManager:
             no_image = self._current_image is None
             fetch_busy = self._fetch_in_progress
 
-        log.debug("_tick: active=%d max=%d no_image=%s fetch_busy=%s",
-                  n_active, cfg.max_simultaneous, no_image, fetch_busy)
+        log.debug("_tick: active=%d max=%d no_image=%s fetch_busy=%s paused=%s",
+                  n_active, cfg.max_simultaneous, no_image, fetch_busy, self._paused)
 
-        if n_active < cfg.max_simultaneous and not no_image and not fetch_busy:
+        if n_active < cfg.max_simultaneous and not no_image and not fetch_busy and not self._paused:
             GLib.idle_add(self._spawn_one)
 
         return True  # keep repeating
@@ -314,6 +425,8 @@ class DynamicOverlayManager:
             if self._current_image is None:
                 return False
             if self._fetch_in_progress:
+                return False
+            if self._paused:
                 return False
             self._fetch_in_progress = True
             image = self._current_image
@@ -351,7 +464,7 @@ class DynamicOverlayManager:
                 return False
 
             # IDs to exclude: currently displayed + recently shown
-            active_ids = {cid for _, _, _, cid in self._active}
+            active_ids = {ch.id for _, _, _, ch in self._active}
             recently = set(self._recently_shown)
             candidates = [c for c in chunks if c.id not in active_ids and c.id not in recently]
             if not candidates:
@@ -388,22 +501,46 @@ class DynamicOverlayManager:
 
         log.debug("_do_spawn: spawning '%s…' in zone %d", chunk.text[:40], zone)
 
-        zx, zy, zw, zh = _zone_rect(zone, self._screen_w, self._screen_h)
-        # Shift zone coordinates into the work area (accounts for top/side panels)
-        zx += self._work_x
-        zy += self._work_y
-        max_w = int(self._screen_w * cfg.max_screen_fraction * 4)  # reasonable max
-        max_h = int(self._screen_h * cfg.max_screen_fraction * 4)
-        max_w = max(200, min(max_w, zw - 20))
-        max_h = max(100, min(max_h, zh - 20))
-
-        # Random offset within zone
-        ox = random.randint(0, max(0, zw - max_w - 10))
-        oy = random.randint(0, max(0, zh - max_h - 10))
+        # Bounds: a zone-cell rectangle inside the work area, inset on every
+        # edge so adjacent zones never share a pixel. The window is then
+        # natural-sized inside this rectangle and clamped before fading in.
+        bounds = compute_overlay_bounds(
+            zone=zone,
+            work_x=self._work_x,
+            work_y=self._work_y,
+            work_w=self._screen_w,
+            work_h=self._screen_h,
+            gap_px=_INTER_ZONE_GAP_PX,
+        )
+        max_w = bounds.max_w
+        max_h = bounds.max_h
+        screen_x = bounds.x
+        screen_y = bounds.y
 
         attribution = _format_attribution(chunk)
 
-        chunk_id = chunk.id
+        # Gently dampen font sizes that are significantly above the typical baseline.
+        # This reduces right-edge overflow without changing normal-sized fonts at all.
+        _FONT_BASELINE_PX = 18
+        font_size = cfg.font_size
+        if font_size > int(_FONT_BASELINE_PX * 1.5):  # > 27 px
+            font_size = int(_FONT_BASELINE_PX + (font_size - _FONT_BASELINE_PX) * 0.65)
+            log.debug("Font size dampened from %d to %d px", cfg.font_size, font_size)
+
+        font_file = ""
+        if self._font_options:
+            try:
+                chosen_font = pick_font_for_context(
+                    options=self._font_options,
+                    context=f"{chunk.text}\n{attribution}".strip(),
+                    purpose="dynamic content overlay",
+                    model=self._config.overlay.model or self._config.ollama.model,
+                    host=self._config.ollama.host,
+                )
+                font_file = str(chosen_font)
+                log.debug("Dynamic overlay font selected: %s", font_file)
+            except Exception as e:
+                log.warning("Dynamic font selection failed: %s", e)
 
         def _on_destroyed() -> None:
             with self._lock:
@@ -413,23 +550,45 @@ class DynamicOverlayManager:
         overlay = FloatingOverlay(
             text=chunk.text,
             attribution=attribution,
-            screen_x=zx + ox,
-            screen_y=zy + oy,
+            screen_x=screen_x,
+            screen_y=screen_y,
             max_width=max_w,
             max_height=max_h,
-            font_size=cfg.font_size,
-            font_file=cfg.font_file,
+            font_size=font_size,
+            font_file=font_file,
             on_destroyed=_on_destroyed,
+            chunk=chunk,
+            on_read=self._open_reader,
         )
 
         lifetime = random.randint(cfg.min_lifetime_seconds, cfg.max_lifetime_seconds)
         expire_time = time.monotonic() + lifetime
 
         with self._lock:
-            self._active.append((overlay, expire_time, zone, chunk_id))
+            self._active.append((overlay, expire_time, zone, chunk))
 
         overlay.fade_in()
         return False
+
+    def _open_reader(self, chunk) -> bool:
+        """Open a ReaderWindow for the given chunk. Called on the GLib main thread."""
+        from .reader_window import ReaderWindow
+        win = ReaderWindow(chunk, self._config)
+        win.show_all()
+        return False
+
+
+def _truncate_for_display(text: str, max_chars: int) -> str:
+    """Trim ``text`` to ~``max_chars`` characters, breaking on word boundary."""
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    truncated = text[:max_chars]
+    last_space = truncated.rfind(" ")
+    # Only break on whitespace if it doesn't strand too much of the budget
+    if last_space > int(max_chars * 0.7):
+        truncated = truncated[:last_space]
+    return truncated.rstrip(" ,.;:—-") + "…"
 
 
 def _format_attribution(chunk) -> str:

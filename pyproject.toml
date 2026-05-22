@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 ui = ["tomli_w>=1.0"]
+grok = ["openai>=1.0"]
 ebooks = [
     "ebooklib>=0.18",
     "beautifulsoup4>=4.12",
@@ -29,4 +30,4 @@ driftwall = "driftwall.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["driftwall*"]
+include = ["driftwall*", "image_sidecar*"]

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import random
 from pathlib import Path
 
 from .content_store import ContentChunk, get_chroma_client, get_collection
-from .db import ImageRecord, list_content_source_paths
+from .db import ImageRecord, get_image_embedding, list_content_source_paths, upsert_image_embedding
+
+log = logging.getLogger(__name__)
 
 
 def build_image_query(image: ImageRecord) -> str:
@@ -33,13 +36,18 @@ def search_content(
     host: str,
     n_results: int = 10,
     source_paths: list[str] | None = None,
+    query_embedding: list[float] | None = None,
 ) -> list[ContentChunk]:
-    """Embed query_text and return the top-n matching ContentChunks."""
-    import ollama  # type: ignore[import]
+    """Search for top-n matching ContentChunks.
 
-    client = ollama.Client(host=host)
-    resp = client.embed(model=embed_model, input=[query_text])
-    query_embedding = resp.embeddings[0]
+    If *query_embedding* is provided it is used directly, skipping the Ollama
+    embed call.  Otherwise *query_text* is embedded on the fly.
+    """
+    if query_embedding is None:
+        import ollama  # type: ignore[import]
+        client = ollama.Client(host=host)
+        resp = client.embed(model=embed_model, input=[query_text])
+        query_embedding = resp.embeddings[0]
 
     where_filter = None
     if source_paths:
@@ -91,14 +99,32 @@ def get_content_for_image(
     config,  # Config
     n_results: int = 10,
 ) -> list[ContentChunk]:
-    """High-level helper: build query from image metadata and search ChromaDB."""
+    """High-level helper: build query from image metadata and search ChromaDB.
+
+    Uses a cached embedding when available; otherwise computes one via Ollama
+    and saves it for future calls (lazy backfill).
+    """
     query = build_image_query(image)
     if not query.strip():
         return []
 
     try:
-        client = get_chroma_client(chroma_path)
-        collection = get_collection(client)
+        chroma_client = get_chroma_client(chroma_path)
+        collection = get_collection(chroma_client)
+        embed_model = config.content.embed_model
+
+        # Use cached embedding if available, otherwise compute and save it.
+        embedding = get_image_embedding(config.resolved_db_path, image.file_hash, embed_model)
+        if embedding is None:
+            from .image_embedder import compute_embedding
+            embedding = compute_embedding(query, embed_model, config.ollama.host)
+            try:
+                upsert_image_embedding(
+                    config.resolved_db_path, image.file_hash, embed_model, embedding
+                )
+            except Exception as save_err:
+                log.debug("Could not save image embedding: %s", save_err)
+
         subset_size = max(0, int(getattr(config.dynamic_overlay, "random_source_subset_size", 0)))
         source_subset: list[str] | None = None
         if subset_size > 0:
@@ -112,12 +138,12 @@ def get_content_for_image(
         return search_content(
             query_text=query,
             collection=collection,
-            embed_model=config.content.embed_model,
+            embed_model=embed_model,
             host=config.ollama.host,
             n_results=n_results,
             source_paths=source_subset,
+            query_embedding=embedding,
         )
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning("Content search failed: %s", e)
+        log.warning("Content search failed: %s", e)
         return []

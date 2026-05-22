@@ -1,4 +1,4 @@
-"""Ollama-based image classification and JSON flattening."""
+"""Image classification (Grok or Ollama) and JSON flattening."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .config import OllamaConfig
+from .config import GrokConfig, OllamaConfig
 from .db import ImageRecord
 
 logger = logging.getLogger(__name__)
@@ -80,10 +80,15 @@ def classify_image(
     prompt: str,
     ollama_config: OllamaConfig,
     image_bytes: bytes | None = None,
+    context: str | None = None,
 ) -> dict[str, Any]:
     """
     Send the image to Ollama and return the parsed JSON classification.
     Raises ClassificationError on any failure.
+
+    If *context* is provided it is appended to the message so the model can
+    use verified external metadata (e.g. titles/descriptions from an image
+    archive) to improve field accuracy.
     """
     try:
         import ollama  # type: ignore[import]
@@ -94,13 +99,23 @@ def classify_image(
     if image_bytes is None:
         image_bytes = prepare_image(path, ollama_config.max_image_pixels)
 
+    logger.info("Classifying %s  →  %s @ %s", path.name, ollama_config.model, ollama_config.host)
+
+    message_content = prompt
+    if context:
+        message_content = (
+            f"{prompt}\n\n"
+            f"Additional verified metadata about this image "
+            f"(use it to improve accuracy of your classification):\n{context}"
+        )
+
     try:
         response = client.chat(
             model=ollama_config.model,
             messages=[
                 {
                     "role": "user",
-                    "content": prompt,
+                    "content": message_content,
                     "images": [image_bytes],
                 }
             ],
@@ -128,6 +143,83 @@ def classify_image(
 
     if not content.strip():
         raise ClassificationError(f"Empty response from model for {path.name}.")
+
+    try:
+        return extract_json_from_response(content, path.name)
+    except ClassificationError as e:
+        if content.strip():
+            raise ClassificationParseError(str(e), raw_text=content) from e
+        raise
+
+
+def classify_image_grok(
+    path: Path,
+    prompt: str,
+    grok_config: GrokConfig,
+    image_bytes: bytes | None = None,
+    context: str | None = None,
+) -> dict[str, Any]:
+    """
+    Send the image to xAI Grok and return the parsed JSON classification.
+    API key is read from grok_config.api_key, falling back to XAI_API_KEY env var.
+    Raises ClassificationError on any failure.
+    """
+    import base64
+    import os
+
+    try:
+        from openai import OpenAI  # type: ignore[import]
+    except ImportError as e:
+        raise ClassificationError("openai package not installed (pip install openai)") from e
+
+    api_key = grok_config.api_key or os.environ.get("XAI_API_KEY", "")
+    if not api_key:
+        raise ClassificationError(
+            "No Grok API key configured. Set grok.api_key in config.toml or XAI_API_KEY env var."
+        )
+
+    if image_bytes is None:
+        image_bytes = prepare_image(path, grok_config.max_image_pixels)
+
+    message_text = prompt
+    if context:
+        message_text = (
+            f"{prompt}\n\n"
+            f"Additional verified metadata about this image "
+            f"(use it to improve accuracy of your classification):\n{context}"
+        )
+
+    import urllib.parse
+    host = urllib.parse.urlparse(grok_config.base_url).netloc or grok_config.base_url
+    logger.info("Classifying %s  →  %s @ %s", path.name, grok_config.model, host)
+
+    b64_image = base64.b64encode(image_bytes).decode("ascii")
+    client = OpenAI(api_key=api_key, base_url=grok_config.base_url, timeout=grok_config.timeout)
+
+    try:
+        response = client.chat.completions.create(
+            model=grok_config.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"},
+                        },
+                        {"type": "text", "text": message_text},
+                    ],
+                }
+            ],
+        )
+    except Exception as e:
+        raise ClassificationError(f"Grok API request failed for {path}: {e}") from e
+
+    content = response.choices[0].message.content or ""
+    logger.debug("Raw Grok response for %s:\n%s", path.name, content)
+
+    if not content.strip():
+        raise ClassificationError(f"Empty response from Grok for {path.name}.")
 
     try:
         return extract_json_from_response(content, path.name)

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import logging
 import random
 import re
+import subprocess
 import textwrap
 from pathlib import Path
 
@@ -44,6 +47,101 @@ def _resolve_font(font_file: str) -> str | None:
         if Path(candidate).exists():
             return candidate
     return None
+
+
+def resolve_font_family(font_file: str, fallback: str = "Sans") -> str:
+    """Resolve a GTK/Pango font-family from a font file path."""
+    if not font_file:
+        return fallback
+
+    try:
+        from PIL import ImageFont
+
+        family, _style = ImageFont.truetype(font_file, size=16).getname()
+        if family and family.strip():
+            return family.strip()
+    except Exception:
+        pass
+
+    # Prefer fontconfig's parsed family name before filename heuristics.
+    try:
+        out = subprocess.run(
+            ["fc-scan", "--format", "%{family[0]}\n", font_file],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        ).stdout.strip()
+        if out:
+            return out
+    except Exception:
+        pass
+
+    stem = Path(font_file).stem
+    stem = stem.replace("_", " ").replace("-", " ")
+    stem = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", stem)
+    stem = re.sub(
+        r"\b(?:Regular|Italic|Oblique|Bold|SemiBold|DemiBold|Medium|Light|ExtraBold|Black|Thin)\b",
+        "",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    stem = re.sub(r"\s+", " ", stem).strip()
+    return stem or fallback
+
+
+def register_font_with_fontconfig(font_file: str) -> bool:
+    """Register a specific font file for this process via fontconfig."""
+    if not font_file:
+        return False
+
+    font_path = Path(font_file).expanduser()
+    if not font_path.is_file():
+        logger.warning("dynamic_overlay.font_file does not exist: %s", font_file)
+        return False
+
+    libname = ctypes.util.find_library("fontconfig") or "libfontconfig.so.1"
+    try:
+        fc = ctypes.CDLL(libname)
+    except OSError as e:
+        logger.warning("Could not load fontconfig (%s): %s", libname, e)
+        return False
+
+    fc.FcInit.restype = ctypes.c_int
+    fc.FcConfigGetCurrent.restype = ctypes.c_void_p
+    fc.FcConfigAppFontAddFile.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    fc.FcConfigAppFontAddFile.restype = ctypes.c_int
+    fc.FcConfigBuildFonts.argtypes = [ctypes.c_void_p]
+    fc.FcConfigBuildFonts.restype = ctypes.c_int
+
+    if fc.FcInit() == 0:
+        logger.warning("fontconfig initialization failed")
+        return False
+
+    cfg = fc.FcConfigGetCurrent()
+    if not cfg:
+        logger.warning("fontconfig returned null current config")
+        return False
+
+    added = fc.FcConfigAppFontAddFile(cfg, str(font_path).encode("utf-8"))
+    if added == 0:
+        logger.warning("fontconfig failed to register font file: %s", font_path)
+        return False
+
+    fc.FcConfigBuildFonts(cfg)
+    try:
+        import gi
+
+        gi.require_version("PangoCairo", "1.0")
+        from gi.repository import PangoCairo
+
+        font_map = PangoCairo.FontMap.get_default()
+        if font_map is not None:
+            font_map.changed()
+    except Exception as e:
+        logger.debug("Could not refresh Pango font map: %s", e)
+    logger.info("Registered dynamic overlay font via fontconfig: %s", font_path)
+    return True
 
 
 def scan_font_dir(font_dir: str) -> list[Path]:
@@ -219,6 +317,7 @@ def apply_overlay(
     text: str,
     quadrant: str,
     font_file: str,
+    font_size: int,
     output_path: Path,
     target_aspect_ratio: float | None = None,
 ) -> Path:
@@ -256,7 +355,7 @@ def apply_overlay(
             vis_y0, vis_y1 = crop_y, crop_y + vis_h
 
     # ── font ─────────────────────────────────────────────────────────────────
-    font_size = max(28, int(min(w, h) * 0.042))
+    font_size = max(28, font_size) if font_size > 0 else max(28, int(min(w, h) * 0.042))
     resolved = _resolve_font(font_file)
     if resolved:
         try:
